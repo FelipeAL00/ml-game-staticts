@@ -3,15 +3,17 @@ app.py - Ponto de entrada principal do projeto ML Game Statistics (Mega Sena).
 
 Pipeline de Machine Learning para análise da Mega Sena:
 1. Carregar dados históricos (2020-2026)
-2. Engenharia de features (frequência, atraso, paridade, soma, etc.)
-3. Treinar modelo nos primeiros 5 anos (2020 - março 2025)
-4. Analisar e prever o último ano (abril 2025 - abril 2026)
+2. Engenharia de features (frequência, atraso, paridade, soma, consecutivas,
+   quadrantes, intervalos, décadas, streaks, etc.)
+3. Treinar modelo nos primeiros 5 anos (2020-2025)
+4. Analisar e prever o último ano (2026)
 5. Gerar relatório com estatísticas e análises
 
 Uso:
     python app.py                           # Executa a análise completa
     python app.py --no-plots                # Sem gráficos
     python app.py --model gradient_boosting # Escolher modelo
+    python app.py --ensemble                # Ensemble (RF + GB + LR)
     python app.py --save                    # Salvar modelo treinado
 """
 
@@ -25,6 +27,7 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import StandardScaler
 
 import matplotlib
 matplotlib.use("Agg")
@@ -33,8 +36,9 @@ import seaborn as sns
 
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "raw" / "mega_sena_2020_2026.csv"
-CUTOFF_DATE = pd.Timestamp("2025-04-01")
+CUTOFF_DATE = pd.Timestamp("2026-01-01")
 TOTAL_NUMBERS = 60  # Mega Sena: números de 1 a 60
+NUMBERS_PER_DRAW = 6
 
 MODELS = {
     "random_forest": RandomForestClassifier,
@@ -59,6 +63,11 @@ def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame
     - Atraso (quantos concursos desde a última aparição)
     - Paridade e soma do último concurso
     - Soma média e desvio padrão da janela
+    - Números consecutivos no último sorteio
+    - Distribuição por quadrantes (1-15, 16-30, 31-45, 46-60)
+    - Intervalos (gaps) entre números sorteados
+    - Distribuição por décadas (01-10, 11-20, ..., 51-60)
+    - Streaks (quantas vezes consecutivas cada número apareceu/não apareceu)
 
     Args:
         df: DataFrame com os dados da Mega Sena.
@@ -76,6 +85,7 @@ def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame
         recent_draws = all_draws[max(0, i - window):i]
         recent_numbers = recent_draws.flatten()
 
+        # --- Features originais ---
         freq = Counter(recent_numbers)
         freq_features = {f"freq_{n}": freq.get(n, 0) / len(recent_draws) for n in range(1, TOTAL_NUMBERS + 1)}
 
@@ -88,25 +98,85 @@ def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame
                     break
             delay_features[f"atraso_{n}"] = (len(recent_draws) - last_seen) if last_seen >= 0 else window + 1
 
-        last_draw = all_draws[i - 1]
+        last_draw = sorted(all_draws[i - 1])
         soma_ultimo = int(np.sum(last_draw))
-        pares_ultimo = int(np.sum(last_draw % 2 == 0))
+        pares_ultimo = int(np.sum(np.array(last_draw) % 2 == 0))
         impares_ultimo = 6 - pares_ultimo
 
         somas = [int(np.sum(d)) for d in recent_draws]
         soma_media = np.mean(somas)
         soma_std = np.std(somas)
 
+        # --- Novas features: Consecutivas ---
+        consecutivas = sum(
+            1 for k in range(len(last_draw) - 1)
+            if last_draw[k + 1] - last_draw[k] == 1
+        )
+
+        # --- Novas features: Quadrantes (1-15, 16-30, 31-45, 46-60) ---
+        q1 = sum(1 for n in last_draw if 1 <= n <= 15)
+        q2 = sum(1 for n in last_draw if 16 <= n <= 30)
+        q3 = sum(1 for n in last_draw if 31 <= n <= 45)
+        q4 = sum(1 for n in last_draw if 46 <= n <= 60)
+
+        # --- Novas features: Intervalos (gaps) entre números ---
+        gaps = [last_draw[k + 1] - last_draw[k] for k in range(len(last_draw) - 1)]
+        gap_medio = np.mean(gaps) if gaps else 0
+        gap_max = max(gaps) if gaps else 0
+        gap_min = min(gaps) if gaps else 0
+        gap_std = np.std(gaps) if len(gaps) > 1 else 0
+
+        # --- Novas features: Décadas (01-10, 11-20, ..., 51-60) ---
+        decadas = {}
+        for dec in range(6):
+            low = dec * 10 + 1
+            high = (dec + 1) * 10
+            decadas[f"decada_{low}_{high}"] = sum(1 for n in last_draw if low <= n <= high)
+
+        # --- Novas features: Streaks por número (aparições consecutivas) ---
+        streak_features = {}
+        for n in range(1, TOTAL_NUMBERS + 1):
+            streak = 0
+            for j in range(len(recent_draws) - 1, -1, -1):
+                if n in recent_draws[j]:
+                    streak += 1
+                else:
+                    break
+            streak_features[f"streak_{n}"] = streak
+
+        # --- Novas features: Média de frequência na janela (quentes/frios) ---
+        hot_count = sum(1 for n in range(1, TOTAL_NUMBERS + 1) if freq.get(n, 0) / len(recent_draws) > 0.12)
+        cold_count = sum(1 for n in range(1, TOTAL_NUMBERS + 1) if freq.get(n, 0) / len(recent_draws) < 0.08)
+
+        # --- Novas features: Amplitude e mediana do sorteio ---
+        amplitude = last_draw[-1] - last_draw[0]
+        mediana = float(np.median(last_draw))
+
         row = {
             "concurso": df.iloc[i]["concurso"],
             "idx": i,
             **freq_features,
             **delay_features,
+            **streak_features,
+            **decadas,
             "soma_ultimo": soma_ultimo,
             "pares_ultimo": pares_ultimo,
             "impares_ultimo": impares_ultimo,
             "soma_media_janela": soma_media,
             "soma_std_janela": soma_std,
+            "consecutivas": consecutivas,
+            "quadrante_1_15": q1,
+            "quadrante_16_30": q2,
+            "quadrante_31_45": q3,
+            "quadrante_46_60": q4,
+            "gap_medio": gap_medio,
+            "gap_max": gap_max,
+            "gap_min": gap_min,
+            "gap_std": gap_std,
+            "hot_count": hot_count,
+            "cold_count": cold_count,
+            "amplitude": amplitude,
+            "mediana": mediana,
         }
         features_list.append(row)
 
@@ -163,64 +233,128 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c not in exclude and c not in target_cols]
 
 
+def _build_single_model(model_name: str, tuned: bool = False):
+    """Cria uma instância de modelo com hiperparâmetros otimizados ou padrão."""
+    if tuned:
+        if model_name == "random_forest":
+            return RandomForestClassifier(
+                n_estimators=300,
+                max_depth=10,
+                min_samples_split=5,
+                min_samples_leaf=3,
+                max_features="sqrt",
+                class_weight="balanced",
+                random_state=42,
+            )
+        elif model_name == "gradient_boosting":
+            return GradientBoostingClassifier(
+                n_estimators=200,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.8,
+                min_samples_split=5,
+                min_samples_leaf=3,
+                random_state=42,
+            )
+        else:
+            return LogisticRegression(
+                max_iter=2000,
+                C=0.5,
+                penalty="l2",
+                solver="lbfgs",
+                class_weight="balanced",
+                random_state=42,
+            )
+    else:
+        if model_name == "logistic_regression":
+            return LogisticRegression(max_iter=1000, random_state=42)
+        else:
+            return MODELS[model_name](n_estimators=100, random_state=42)
+
+
 def train_and_evaluate(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     model_name: str = "random_forest",
     top_n: int = 10,
+    ensemble: bool = False,
 ) -> dict:
-    """Treina um modelo para cada dezena e avalia no último ano.
+    """Treina modelo(s) para cada dezena e avalia no último ano.
 
     Para cada número (1-60), treina um classificador binário que prevê
     se aquele número será sorteado no próximo concurso.
 
+    Quando ensemble=True, treina Random Forest + Gradient Boosting + Logistic
+    Regression com hiperparâmetros otimizados e faz média das probabilidades.
+
     Args:
         train_df: DataFrame de treino (5 primeiros anos).
         test_df: DataFrame de teste (último ano).
-        model_name: Nome do modelo.
+        model_name: Nome do modelo (ignorado se ensemble=True).
         top_n: Quantidade de dezenas mais prováveis para recomendar.
+        ensemble: Se True, usa ensemble de 3 modelos.
 
     Returns:
         Dicionário com resultados detalhados.
     """
     feature_cols = get_feature_columns(train_df)
-    X_train = train_df[feature_cols].values
-    X_test = test_df[feature_cols].values
+    X_train_raw = train_df[feature_cols].values
+    X_test_raw = test_df[feature_cols].values
+
+    # Normalizar features para melhor desempenho
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train_raw)
+    X_test = scaler.transform(X_test_raw)
 
     results_per_number = {}
     all_probabilities = {}
+    per_concurso_probas = {}  # {n: array of probabilities per test concurso}
 
-    print(f"\n   Treinando modelos para cada dezena (1-{TOTAL_NUMBERS})...")
+    if ensemble:
+        model_names_used = ["random_forest", "gradient_boosting", "logistic_regression"]
+        print(f"\n   Treinando ENSEMBLE (RF + GB + LR) para cada dezena (1-{TOTAL_NUMBERS})...")
+    else:
+        model_names_used = [model_name]
+        print(f"\n   Treinando modelos para cada dezena (1-{TOTAL_NUMBERS})...")
 
     for n in range(1, TOTAL_NUMBERS + 1):
         target_col = f"target_{n}"
         y_train = train_df[target_col].values
         y_test = test_df[target_col].values
 
-        model_cls = MODELS[model_name]
-        if model_name == "logistic_regression":
-            model = model_cls(max_iter=1000, random_state=42)
-        else:
-            model = model_cls(n_estimators=100, random_state=42)
+        all_proba_cols = []
+        all_preds = []
+        models_trained = []
 
-        model.fit(X_train, y_train)
+        for m_name in model_names_used:
+            model = _build_single_model(m_name, tuned=ensemble)
+            model.fit(X_train, y_train)
 
-        y_pred = model.predict(X_test)
-        y_proba = model.predict_proba(X_test)
+            y_pred = model.predict(X_test)
+            y_proba = model.predict_proba(X_test)
+            proba_col = y_proba[:, 1] if y_proba.shape[1] > 1 else y_proba[:, 0]
 
-        proba_col = y_proba[:, 1] if y_proba.shape[1] > 1 else y_proba[:, 0]
-        avg_proba = float(np.mean(proba_col))
+            all_proba_cols.append(proba_col)
+            all_preds.append(y_pred)
+            models_trained.append(model)
 
-        acc = accuracy_score(y_test, y_pred)
+        # Média das probabilidades (soft voting)
+        avg_proba_col = np.mean(all_proba_cols, axis=0)
+        avg_proba = float(np.mean(avg_proba_col))
+
+        # Predição por maioria (hard voting)
+        majority_pred = (np.mean(all_preds, axis=0) >= 0.5).astype(int)
+        acc = accuracy_score(y_test, majority_pred)
 
         results_per_number[n] = {
             "accuracy": acc,
             "avg_probability": avg_proba,
             "actual_frequency": float(np.mean(y_test)),
-            "predicted_frequency": float(np.mean(y_pred)),
-            "model": model,
+            "predicted_frequency": float(np.mean(majority_pred)),
+            "model": models_trained[0],
         }
         all_probabilities[n] = avg_proba
+        per_concurso_probas[n] = avg_proba_col
 
     ranking = sorted(all_probabilities.items(), key=lambda x: x[1], reverse=True)
 
@@ -228,6 +362,8 @@ def train_and_evaluate(
         "results_per_number": results_per_number,
         "ranking": ranking,
         "feature_columns": feature_cols,
+        "per_concurso_probas": per_concurso_probas,
+        "ensemble": ensemble,
     }
 
 
@@ -276,6 +412,142 @@ def analyze_last_year(
     }
 
 
+def predict_full_games(
+    df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    results: dict,
+) -> dict:
+    """Prevê jogos completos (6 dezenas) para cada concurso de teste e compara com o real.
+
+    Para cada concurso, seleciona as 6 dezenas com maior probabilidade
+    e compara com as 6 dezenas reais sorteadas.
+
+    Args:
+        df: DataFrame original da Mega Sena.
+        test_df: DataFrame de teste com features.
+        results: Resultados do treinamento (inclui per_concurso_probas).
+
+    Returns:
+        Dicionário com previsões, acertos e estatísticas por jogo.
+    """
+    dezena_cols = ["dezena_1", "dezena_2", "dezena_3", "dezena_4", "dezena_5", "dezena_6"]
+    per_concurso_probas = results["per_concurso_probas"]
+    test_concursos = test_df["concurso"].values
+    num_test = len(test_concursos)
+
+    games = []
+    total_hits = 0
+    total_numbers = 0
+
+    for i in range(num_test):
+        concurso = int(test_concursos[i])
+        original_row = df[df["concurso"] == concurso].iloc[0]
+        actual_numbers = sorted(original_row[dezena_cols].astype(int).values.tolist())
+        data_jogo = original_row["data"]
+
+        # Probabilidade de cada dezena para este concurso
+        probas = {n: float(per_concurso_probas[n][i]) for n in range(1, TOTAL_NUMBERS + 1)}
+
+        # Selecionar as 6 com maior probabilidade
+        sorted_probas = sorted(probas.items(), key=lambda x: x[1], reverse=True)
+        predicted_numbers = sorted([n for n, _ in sorted_probas[:NUMBERS_PER_DRAW]])
+
+        # Calcular acertos
+        actual_set = set(actual_numbers)
+        predicted_set = set(predicted_numbers)
+        hits = len(actual_set & predicted_set)
+        total_hits += hits
+        total_numbers += NUMBERS_PER_DRAW
+
+        games.append({
+            "concurso": concurso,
+            "data": data_jogo,
+            "actual": actual_numbers,
+            "predicted": predicted_numbers,
+            "hits": hits,
+            "top_proba": sorted_probas[0][1],
+            "sixth_proba": sorted_probas[5][1],
+        })
+
+    # Estatísticas gerais
+    hits_list = [g["hits"] for g in games]
+    hits_distribution = Counter(hits_list)
+
+    return {
+        "games": games,
+        "total_games": num_test,
+        "total_hits": total_hits,
+        "total_numbers": total_numbers,
+        "avg_hits_per_game": total_hits / num_test if num_test > 0 else 0,
+        "hit_rate": total_hits / total_numbers if total_numbers > 0 else 0,
+        "hits_distribution": dict(sorted(hits_distribution.items())),
+        "max_hits": max(hits_list) if hits_list else 0,
+    }
+
+
+def print_full_games_report(prediction: dict) -> None:
+    """Imprime o relatório de previsão de jogos completos."""
+    games = prediction["games"]
+
+    print("\n" + "=" * 80)
+    print("   PREVISÃO DE JOGOS COMPLETOS - MEGA SENA 2026")
+    print("=" * 80)
+    print(f"\n   Total de jogos analisados: {prediction['total_games']}")
+    print(f"   Média de acertos por jogo: {prediction['avg_hits_per_game']:.2f} de 6")
+    print(f"   Taxa de acerto (dezenas): {prediction['hit_rate'] * 100:.1f}%")
+    print(f"   Máximo de acertos em um jogo: {prediction['max_hits']}")
+
+    print("\n" + "-" * 80)
+    print("   DISTRIBUIÇÃO DE ACERTOS")
+    print("-" * 80)
+    for hits, count in sorted(prediction["hits_distribution"].items()):
+        bar = "#" * (count * 2)
+        pct = count / prediction["total_games"] * 100
+        print(f"   {hits} acertos: {count:3d} jogos ({pct:5.1f}%) {bar}")
+
+    print("\n" + "-" * 80)
+    print("   DETALHAMENTO POR CONCURSO")
+    print("-" * 80)
+    print(f"   {'Conc.':>6}  {'Data':>12}  {'Previsto':^38}  {'Real':^38}  {'Acertos':>7}")
+    print("   " + "-" * 105)
+
+    for g in games:
+        prev_str = ", ".join(f"{n:02d}" for n in g["predicted"])
+        real_str = ", ".join(f"{n:02d}" for n in g["actual"])
+
+        # Marcar acertos
+        actual_set = set(g["actual"])
+        predicted_set = set(g["predicted"])
+        matched = actual_set & predicted_set
+
+        prev_marked = ", ".join(
+            f"*{n:02d}*" if n in matched else f" {n:02d} " for n in g["predicted"]
+        )
+        real_marked = ", ".join(
+            f"*{n:02d}*" if n in matched else f" {n:02d} " for n in g["actual"]
+        )
+
+        print(f"   {g['concurso']:>6}  {g['data']:>12}  {prev_marked:<38}  {real_marked:<38}  {g['hits']:>3}/6")
+
+    # Resumo final
+    print("\n" + "-" * 80)
+    print("   RESUMO DE ASSERTIVIDADE")
+    print("-" * 80)
+    print(f"   Assertividade por dezena:  {prediction['hit_rate'] * 100:.1f}%")
+    print(f"   Total de dezenas corretas: {prediction['total_hits']} de {prediction['total_numbers']}")
+    print(f"   Média de acertos/jogo:     {prediction['avg_hits_per_game']:.2f} de 6")
+
+    # Jogos com mais acertos
+    best_games = sorted(games, key=lambda g: g["hits"], reverse=True)[:5]
+    print("\n   Melhores jogos (mais acertos):")
+    for g in best_games:
+        matched = set(g["actual"]) & set(g["predicted"])
+        matched_str = ", ".join(f"{n:02d}" for n in sorted(matched))
+        print(f"     Concurso {g['concurso']} ({g['data']}): {g['hits']}/6 acertos — dezenas: {matched_str}")
+
+    print("\n" + "=" * 80)
+
+
 def print_report(results: dict, analysis: dict, train_size: int, test_size: int) -> None:
     """Imprime o relatório completo da análise."""
     ranking = results["ranking"]
@@ -284,8 +556,8 @@ def print_report(results: dict, analysis: dict, train_size: int, test_size: int)
     print("   RELATÓRIO DE ANÁLISE - MEGA SENA")
     print("=" * 60)
 
-    print(f"\n   Período de treino: março 2020 - março 2025 ({train_size} concursos)")
-    print(f"   Período de teste:  abril 2025 - abril 2026 ({test_size} concursos)")
+    print(f"\n   Período de treino: março 2020 - dezembro 2025 ({train_size} concursos)")
+    print(f"   Período de teste:  janeiro 2026 - abril 2026 ({test_size} concursos)")
 
     print("\n" + "-" * 60)
     print("   TOP 10 DEZENAS MAIS PROVÁVEIS (previsão do modelo)")
@@ -438,14 +710,16 @@ def run_mega_sena_analysis(
     show_plots: bool = True,
     save: bool = False,
     window: int = 30,
+    ensemble: bool = False,
 ) -> dict:
     """Executa a análise completa da Mega Sena.
 
     Args:
-        model_name: Modelo de ML a usar.
+        model_name: Modelo de ML a usar (ignorado se ensemble=True).
         show_plots: Se True, gera gráficos.
         save: Se True, salva gráficos e modelo.
         window: Tamanho da janela para features de frequência.
+        ensemble: Se True, usa ensemble de 3 modelos (RF + GB + LR).
 
     Returns:
         Dicionário com todos os resultados.
@@ -485,30 +759,42 @@ def run_mega_sena_analysis(
     print("3. DIVISÃO TEMPORAL DOS DADOS")
     print("=" * 60)
     train_df, test_df = split_by_date(df, features_df)
-    print(f"   Treino (5 primeiros anos): {len(train_df)} concursos")
-    print(f"   Teste (último ano):        {len(test_df)} concursos")
+    print(f"   Treino (2020-2025):  {len(train_df)} concursos")
+    print(f"   Teste (2026):        {len(test_df)} concursos")
     print(f"   Corte temporal: {CUTOFF_DATE.strftime('%d/%m/%Y')}")
 
     # 5. Treinar e avaliar
     print("\n" + "=" * 60)
     print("4. TREINAMENTO E AVALIAÇÃO")
     print("=" * 60)
-    print(f"   Modelo: {model_name}")
-    results = train_and_evaluate(train_df, test_df, model_name=model_name)
+    if ensemble:
+        print("   Modo: ENSEMBLE (Random Forest + Gradient Boosting + Logistic Regression)")
+        print("   Hiperparâmetros: otimizados (tuned)")
+        print("   Votação: soft voting (média de probabilidades)")
+    else:
+        print(f"   Modelo: {model_name}")
+    results = train_and_evaluate(train_df, test_df, model_name=model_name, ensemble=ensemble)
 
-    # 6. Análise do último ano
+    # 6. Análise por dezena
     print("\n" + "=" * 60)
-    print("5. ANÁLISE DO ÚLTIMO ANO")
+    print("5. ANÁLISE POR DEZENA")
     print("=" * 60)
     analysis = analyze_last_year(df, test_df, results)
 
-    # 7. Relatório
-    print_report(results, analysis, len(train_df), len(test_df))
+    # 7. Previsão de jogos completos
+    print("\n" + "=" * 60)
+    print("6. PREVISÃO DE JOGOS COMPLETOS")
+    print("=" * 60)
+    prediction = predict_full_games(df, test_df, results)
 
-    # 8. Gráficos
+    # 8. Relatórios
+    print_report(results, analysis, len(train_df), len(test_df))
+    print_full_games_report(prediction)
+
+    # 9. Gráficos
     if show_plots or save:
         print("\n" + "=" * 60)
-        print("6. GERANDO GRÁFICOS")
+        print("7. GERANDO GRÁFICOS")
         print("=" * 60)
         plots_dir = Path(__file__).resolve().parent / "data" / "processed"
         saved_plots = plot_analysis(results, analysis, plots_dir)
@@ -518,6 +804,7 @@ def run_mega_sena_analysis(
     return {
         "results": results,
         "analysis": analysis,
+        "prediction": prediction,
         "train_size": len(train_df),
         "test_size": len(test_df),
     }
@@ -547,6 +834,11 @@ def main():
         help="Desativar geração de gráficos",
     )
     parser.add_argument(
+        "--ensemble",
+        action="store_true",
+        help="Usar ensemble de modelos (RF + GB + LR) com hiperparâmetros otimizados",
+    )
+    parser.add_argument(
         "--save",
         action="store_true",
         help="Salvar gráficos e modelo treinado",
@@ -559,6 +851,7 @@ def main():
         show_plots=not args.no_plots,
         save=args.save,
         window=args.window,
+        ensemble=args.ensemble,
     )
 
 
