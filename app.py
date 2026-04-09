@@ -33,8 +33,9 @@ import seaborn as sns
 
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "raw" / "mega_sena_2020_2026.csv"
-CUTOFF_DATE = pd.Timestamp("2025-04-01")
+CUTOFF_DATE = pd.Timestamp("2026-01-01")
 TOTAL_NUMBERS = 60  # Mega Sena: números de 1 a 60
+NUMBERS_PER_DRAW = 6
 
 MODELS = {
     "random_forest": RandomForestClassifier,
@@ -189,6 +190,7 @@ def train_and_evaluate(
 
     results_per_number = {}
     all_probabilities = {}
+    per_concurso_probas = {}  # {n: array of probabilities per test concurso}
 
     print(f"\n   Treinando modelos para cada dezena (1-{TOTAL_NUMBERS})...")
 
@@ -221,6 +223,7 @@ def train_and_evaluate(
             "model": model,
         }
         all_probabilities[n] = avg_proba
+        per_concurso_probas[n] = proba_col
 
     ranking = sorted(all_probabilities.items(), key=lambda x: x[1], reverse=True)
 
@@ -228,6 +231,7 @@ def train_and_evaluate(
         "results_per_number": results_per_number,
         "ranking": ranking,
         "feature_columns": feature_cols,
+        "per_concurso_probas": per_concurso_probas,
     }
 
 
@@ -276,6 +280,142 @@ def analyze_last_year(
     }
 
 
+def predict_full_games(
+    df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    results: dict,
+) -> dict:
+    """Prevê jogos completos (6 dezenas) para cada concurso de teste e compara com o real.
+
+    Para cada concurso, seleciona as 6 dezenas com maior probabilidade
+    e compara com as 6 dezenas reais sorteadas.
+
+    Args:
+        df: DataFrame original da Mega Sena.
+        test_df: DataFrame de teste com features.
+        results: Resultados do treinamento (inclui per_concurso_probas).
+
+    Returns:
+        Dicionário com previsões, acertos e estatísticas por jogo.
+    """
+    dezena_cols = ["dezena_1", "dezena_2", "dezena_3", "dezena_4", "dezena_5", "dezena_6"]
+    per_concurso_probas = results["per_concurso_probas"]
+    test_concursos = test_df["concurso"].values
+    num_test = len(test_concursos)
+
+    games = []
+    total_hits = 0
+    total_numbers = 0
+
+    for i in range(num_test):
+        concurso = int(test_concursos[i])
+        original_row = df[df["concurso"] == concurso].iloc[0]
+        actual_numbers = sorted(original_row[dezena_cols].astype(int).values.tolist())
+        data_jogo = original_row["data"]
+
+        # Probabilidade de cada dezena para este concurso
+        probas = {n: float(per_concurso_probas[n][i]) for n in range(1, TOTAL_NUMBERS + 1)}
+
+        # Selecionar as 6 com maior probabilidade
+        sorted_probas = sorted(probas.items(), key=lambda x: x[1], reverse=True)
+        predicted_numbers = sorted([n for n, _ in sorted_probas[:NUMBERS_PER_DRAW]])
+
+        # Calcular acertos
+        actual_set = set(actual_numbers)
+        predicted_set = set(predicted_numbers)
+        hits = len(actual_set & predicted_set)
+        total_hits += hits
+        total_numbers += NUMBERS_PER_DRAW
+
+        games.append({
+            "concurso": concurso,
+            "data": data_jogo,
+            "actual": actual_numbers,
+            "predicted": predicted_numbers,
+            "hits": hits,
+            "top_proba": sorted_probas[0][1],
+            "sixth_proba": sorted_probas[5][1],
+        })
+
+    # Estatísticas gerais
+    hits_list = [g["hits"] for g in games]
+    hits_distribution = Counter(hits_list)
+
+    return {
+        "games": games,
+        "total_games": num_test,
+        "total_hits": total_hits,
+        "total_numbers": total_numbers,
+        "avg_hits_per_game": total_hits / num_test if num_test > 0 else 0,
+        "hit_rate": total_hits / total_numbers if total_numbers > 0 else 0,
+        "hits_distribution": dict(sorted(hits_distribution.items())),
+        "max_hits": max(hits_list) if hits_list else 0,
+    }
+
+
+def print_full_games_report(prediction: dict) -> None:
+    """Imprime o relatório de previsão de jogos completos."""
+    games = prediction["games"]
+
+    print("\n" + "=" * 80)
+    print("   PREVISÃO DE JOGOS COMPLETOS - MEGA SENA 2026")
+    print("=" * 80)
+    print(f"\n   Total de jogos analisados: {prediction['total_games']}")
+    print(f"   Média de acertos por jogo: {prediction['avg_hits_per_game']:.2f} de 6")
+    print(f"   Taxa de acerto (dezenas): {prediction['hit_rate'] * 100:.1f}%")
+    print(f"   Máximo de acertos em um jogo: {prediction['max_hits']}")
+
+    print("\n" + "-" * 80)
+    print("   DISTRIBUIÇÃO DE ACERTOS")
+    print("-" * 80)
+    for hits, count in sorted(prediction["hits_distribution"].items()):
+        bar = "#" * (count * 2)
+        pct = count / prediction["total_games"] * 100
+        print(f"   {hits} acertos: {count:3d} jogos ({pct:5.1f}%) {bar}")
+
+    print("\n" + "-" * 80)
+    print("   DETALHAMENTO POR CONCURSO")
+    print("-" * 80)
+    print(f"   {'Conc.':>6}  {'Data':>12}  {'Previsto':^38}  {'Real':^38}  {'Acertos':>7}")
+    print("   " + "-" * 105)
+
+    for g in games:
+        prev_str = ", ".join(f"{n:02d}" for n in g["predicted"])
+        real_str = ", ".join(f"{n:02d}" for n in g["actual"])
+
+        # Marcar acertos
+        actual_set = set(g["actual"])
+        predicted_set = set(g["predicted"])
+        matched = actual_set & predicted_set
+
+        prev_marked = ", ".join(
+            f"*{n:02d}*" if n in matched else f" {n:02d} " for n in g["predicted"]
+        )
+        real_marked = ", ".join(
+            f"*{n:02d}*" if n in matched else f" {n:02d} " for n in g["actual"]
+        )
+
+        print(f"   {g['concurso']:>6}  {g['data']:>12}  {prev_marked:<38}  {real_marked:<38}  {g['hits']:>3}/6")
+
+    # Resumo final
+    print("\n" + "-" * 80)
+    print("   RESUMO DE ASSERTIVIDADE")
+    print("-" * 80)
+    print(f"   Assertividade por dezena:  {prediction['hit_rate'] * 100:.1f}%")
+    print(f"   Total de dezenas corretas: {prediction['total_hits']} de {prediction['total_numbers']}")
+    print(f"   Média de acertos/jogo:     {prediction['avg_hits_per_game']:.2f} de 6")
+
+    # Jogos com mais acertos
+    best_games = sorted(games, key=lambda g: g["hits"], reverse=True)[:5]
+    print("\n   Melhores jogos (mais acertos):")
+    for g in best_games:
+        matched = set(g["actual"]) & set(g["predicted"])
+        matched_str = ", ".join(f"{n:02d}" for n in sorted(matched))
+        print(f"     Concurso {g['concurso']} ({g['data']}): {g['hits']}/6 acertos — dezenas: {matched_str}")
+
+    print("\n" + "=" * 80)
+
+
 def print_report(results: dict, analysis: dict, train_size: int, test_size: int) -> None:
     """Imprime o relatório completo da análise."""
     ranking = results["ranking"]
@@ -284,8 +424,8 @@ def print_report(results: dict, analysis: dict, train_size: int, test_size: int)
     print("   RELATÓRIO DE ANÁLISE - MEGA SENA")
     print("=" * 60)
 
-    print(f"\n   Período de treino: março 2020 - março 2025 ({train_size} concursos)")
-    print(f"   Período de teste:  abril 2025 - abril 2026 ({test_size} concursos)")
+    print(f"\n   Período de treino: março 2020 - dezembro 2025 ({train_size} concursos)")
+    print(f"   Período de teste:  janeiro 2026 - abril 2026 ({test_size} concursos)")
 
     print("\n" + "-" * 60)
     print("   TOP 10 DEZENAS MAIS PROVÁVEIS (previsão do modelo)")
@@ -485,8 +625,8 @@ def run_mega_sena_analysis(
     print("3. DIVISÃO TEMPORAL DOS DADOS")
     print("=" * 60)
     train_df, test_df = split_by_date(df, features_df)
-    print(f"   Treino (5 primeiros anos): {len(train_df)} concursos")
-    print(f"   Teste (último ano):        {len(test_df)} concursos")
+    print(f"   Treino (2020-2025):  {len(train_df)} concursos")
+    print(f"   Teste (2026):        {len(test_df)} concursos")
     print(f"   Corte temporal: {CUTOFF_DATE.strftime('%d/%m/%Y')}")
 
     # 5. Treinar e avaliar
@@ -496,19 +636,26 @@ def run_mega_sena_analysis(
     print(f"   Modelo: {model_name}")
     results = train_and_evaluate(train_df, test_df, model_name=model_name)
 
-    # 6. Análise do último ano
+    # 6. Análise por dezena
     print("\n" + "=" * 60)
-    print("5. ANÁLISE DO ÚLTIMO ANO")
+    print("5. ANÁLISE POR DEZENA")
     print("=" * 60)
     analysis = analyze_last_year(df, test_df, results)
 
-    # 7. Relatório
-    print_report(results, analysis, len(train_df), len(test_df))
+    # 7. Previsão de jogos completos
+    print("\n" + "=" * 60)
+    print("6. PREVISÃO DE JOGOS COMPLETOS")
+    print("=" * 60)
+    prediction = predict_full_games(df, test_df, results)
 
-    # 8. Gráficos
+    # 8. Relatórios
+    print_report(results, analysis, len(train_df), len(test_df))
+    print_full_games_report(prediction)
+
+    # 9. Gráficos
     if show_plots or save:
         print("\n" + "=" * 60)
-        print("6. GERANDO GRÁFICOS")
+        print("7. GERANDO GRÁFICOS")
         print("=" * 60)
         plots_dir = Path(__file__).resolve().parent / "data" / "processed"
         saved_plots = plot_analysis(results, analysis, plots_dir)
@@ -518,6 +665,7 @@ def run_mega_sena_analysis(
     return {
         "results": results,
         "analysis": analysis,
+        "prediction": prediction,
         "train_size": len(train_df),
         "test_size": len(test_df),
     }
