@@ -2,10 +2,10 @@
 app.py - Ponto de entrada principal do projeto ML Game Statistics (Mega Sena).
 
 Pipeline de Machine Learning para análise da Mega Sena:
-1. Carregar dados históricos (2020-2026)
+1. Carregar dados históricos (2000-2026)
 2. Engenharia de features (frequência, atraso, paridade, soma, consecutivas,
    quadrantes, intervalos, décadas, streaks, etc.)
-3. Treinar modelo nos primeiros 5 anos (2020-2025)
+3. Treinar modelo com dados históricos (2000-2025)
 4. Analisar e prever o último ano (2026)
 5. Gerar relatório com estatísticas e análises
 
@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-DATA_PATH = Path(__file__).resolve().parent / "data" / "raw" / "mega_sena_2020_2026.csv"
+DATA_PATH = Path(__file__).resolve().parent / "data" / "raw" / "mega_sena_2000_2026.csv"
 CUTOFF_DATE = pd.Timestamp("2026-01-01")
 TOTAL_NUMBERS = 60  # Mega Sena: números de 1 a 60
 NUMBERS_PER_DRAW = 6
@@ -759,7 +759,7 @@ def run_mega_sena_analysis(
     print("3. DIVISÃO TEMPORAL DOS DADOS")
     print("=" * 60)
     train_df, test_df = split_by_date(df, features_df)
-    print(f"   Treino (2020-2025):  {len(train_df)} concursos")
+    print(f"   Treino (2000-2025):  {len(train_df)} concursos")
     print(f"   Teste (2026):        {len(test_df)} concursos")
     print(f"   Corte temporal: {CUTOFF_DATE.strftime('%d/%m/%Y')}")
 
