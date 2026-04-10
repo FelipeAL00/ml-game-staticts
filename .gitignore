@@ -25,6 +25,7 @@ data/raw/*.csv
 data/raw/*.json
 !data/raw/.gitkeep
 !data/raw/mega_sena_2020_2026.csv
+!data/raw/mega_sena_2000_2026.csv
 
 # Model files
 models/*.pkl
