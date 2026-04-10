@@ -5,8 +5,8 @@ Pipeline de Machine Learning para análise da Mega Sena:
 1. Carregar dados históricos (2000-2026)
 2. Engenharia de features (frequência, atraso, paridade, soma, consecutivas,
    quadrantes, intervalos, décadas, streaks, etc.)
-3. Treinar modelo com dados históricos (2000-2025)
-4. Analisar e prever o último ano (2026)
+3. Treinar modelo com dados históricos (2000-2020)
+4. Analisar e prever os 6 anos seguintes (2021-2026)
 5. Gerar relatório com estatísticas e análises
 
 Uso:
@@ -26,8 +26,16 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import (
+    accuracy_score,
+    roc_auc_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
 
 import matplotlib
 matplotlib.use("Agg")
@@ -36,7 +44,7 @@ import seaborn as sns
 
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "raw" / "mega_sena_2000_2026.csv"
-CUTOFF_DATE = pd.Timestamp("2026-01-01")
+CUTOFF_DATE = pd.Timestamp("2021-01-01")
 TOTAL_NUMBERS = 60  # Mega Sena: números de 1 a 60
 NUMBERS_PER_DRAW = 6
 
@@ -44,6 +52,7 @@ MODELS = {
     "random_forest": RandomForestClassifier,
     "gradient_boosting": GradientBoostingClassifier,
     "logistic_regression": LogisticRegression,
+    "xgboost": XGBClassifier,
 }
 
 
@@ -85,18 +94,40 @@ def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame
         recent_draws = all_draws[max(0, i - window):i]
         recent_numbers = recent_draws.flatten()
 
-        # --- Features originais ---
-        freq = Counter(recent_numbers)
-        freq_features = {f"freq_{n}": freq.get(n, 0) / len(recent_draws) for n in range(1, TOTAL_NUMBERS + 1)}
-
+        windows = [10, 30, 60]
+        freq_features = {}
         delay_features = {}
-        for n in range(1, TOTAL_NUMBERS + 1):
-            last_seen = -1
-            for j in range(len(recent_draws) - 1, -1, -1):
-                if n in recent_draws[j]:
-                    last_seen = j
-                    break
-            delay_features[f"atraso_{n}"] = (len(recent_draws) - last_seen) if last_seen >= 0 else window + 1
+        hot_cold_features = {}
+
+        for w in windows:
+            draws_w = all_draws[max(0, i - w):i]
+            freq_w = Counter(draws_w.flatten())
+            suffix = f"_{w}" if w != window else ""
+
+            for n in range(1, TOTAL_NUMBERS + 1):
+                freq_features[f"freq_{n}{suffix}"] = freq_w.get(n, 0) / len(draws_w)
+                last_seen = -1
+                for j in range(len(draws_w) - 1, -1, -1):
+                    if n in draws_w[j]:
+                        last_seen = j
+                        break
+                delay_features[f"atraso_{n}{suffix}"] = (len(draws_w) - last_seen) if last_seen >= 0 else w + 1
+
+            hot_cold_features[f"hot_count{suffix}"] = sum(
+                1 for n in range(1, TOTAL_NUMBERS + 1)
+                if freq_w.get(n, 0) / len(draws_w) > 0.12
+            )
+            hot_cold_features[f"cold_count{suffix}"] = sum(
+                1 for n in range(1, TOTAL_NUMBERS + 1)
+                if freq_w.get(n, 0) / len(draws_w) < 0.08
+            )
+
+        base_freq = Counter(recent_numbers)
+        freq_features.update({f"freq_{n}": base_freq.get(n, 0) / len(recent_draws) for n in range(1, TOTAL_NUMBERS + 1)})
+        delay_features.update({
+            f"atraso_{n}": next((len(recent_draws) - j for j in range(len(recent_draws) - 1, -1, -1) if n in recent_draws[j]), window + 1)
+            for n in range(1, TOTAL_NUMBERS + 1)
+        })
 
         last_draw = sorted(all_draws[i - 1])
         soma_ultimo = int(np.sum(last_draw))
@@ -145,20 +176,25 @@ def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame
             streak_features[f"streak_{n}"] = streak
 
         # --- Novas features: Média de frequência na janela (quentes/frios) ---
-        hot_count = sum(1 for n in range(1, TOTAL_NUMBERS + 1) if freq.get(n, 0) / len(recent_draws) > 0.12)
-        cold_count = sum(1 for n in range(1, TOTAL_NUMBERS + 1) if freq.get(n, 0) / len(recent_draws) < 0.08)
+        hot_count = sum(1 for n in range(1, TOTAL_NUMBERS + 1) if base_freq.get(n, 0) / len(recent_draws) > 0.12)
+        cold_count = sum(1 for n in range(1, TOTAL_NUMBERS + 1) if base_freq.get(n, 0) / len(recent_draws) < 0.08)
 
         # --- Novas features: Amplitude e mediana do sorteio ---
         amplitude = last_draw[-1] - last_draw[0]
         mediana = float(np.median(last_draw))
 
+        current_date = df.iloc[i]["data_parsed"]
         row = {
             "concurso": df.iloc[i]["concurso"],
             "idx": i,
+            "ano": current_date.year,
+            "mes": current_date.month,
+            "trimestre": (current_date.month - 1) // 3 + 1,
             **freq_features,
             **delay_features,
             **streak_features,
             **decadas,
+            **hot_cold_features,
             "soma_ultimo": soma_ultimo,
             "pares_ultimo": pares_ultimo,
             "impares_ultimo": impares_ultimo,
@@ -256,6 +292,18 @@ def _build_single_model(model_name: str, tuned: bool = False):
                 min_samples_leaf=3,
                 random_state=42,
             )
+        elif model_name == "xgboost":
+            return XGBClassifier(
+                n_estimators=200,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42,
+                n_jobs=1,
+            )
         else:
             return LogisticRegression(
                 max_iter=2000,
@@ -268,8 +316,76 @@ def _build_single_model(model_name: str, tuned: bool = False):
     else:
         if model_name == "logistic_regression":
             return LogisticRegression(max_iter=1000, random_state=42)
+        elif model_name == "xgboost":
+            return XGBClassifier(
+                n_estimators=100,
+                learning_rate=0.1,
+                use_label_encoder=False,
+                eval_metric="logloss",
+                random_state=42,
+                n_jobs=1,
+            )
         else:
             return MODELS[model_name](n_estimators=100, random_state=42)
+
+
+def _compute_time_series_cv(
+    X: np.ndarray,
+    y: np.ndarray,
+    model_names: list[str],
+    cv_splits: int = 5,
+    ensemble: bool = False,
+) -> dict:
+    """Avalia um alvo com TimeSeriesSplit no conjunto de treino."""
+    if len(y) < 2:
+        return {"cv_accuracy": np.nan, "cv_balanced_accuracy": np.nan, "cv_roc_auc": np.nan}
+
+    n_splits = min(cv_splits, max(1, len(y) - 1))
+    if n_splits < 2:
+        return {"cv_accuracy": np.nan, "cv_roc_auc": np.nan}
+
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    fold_accuracies = []
+    fold_aucs = []
+    fold_balances = []
+
+    for train_idx, val_idx in tscv.split(X):
+        X_train_cv, X_val_cv = X[train_idx], X[val_idx]
+        y_train_cv, y_val_cv = y[train_idx], y[val_idx]
+
+        all_proba_cols = []
+        all_preds = []
+
+        for m_name in model_names:
+            model = _build_single_model(m_name, tuned=ensemble)
+            model.fit(X_train_cv, y_train_cv)
+
+            y_pred_cv = model.predict(X_val_cv)
+            y_proba_cv = model.predict_proba(X_val_cv)
+            proba_col_cv = y_proba_cv[:, 1] if y_proba_cv.shape[1] > 1 else y_proba_cv[:, 0]
+
+            all_proba_cols.append(proba_col_cv)
+            all_preds.append(y_pred_cv)
+
+        avg_proba_cv = np.mean(all_proba_cols, axis=0)
+        maj_pred_cv = (np.mean(all_preds, axis=0) >= 0.5).astype(int)
+        fold_accuracies.append(accuracy_score(y_val_cv, maj_pred_cv))
+
+        try:
+            fold_aucs.append(roc_auc_score(y_val_cv, avg_proba_cv))
+        except ValueError:
+            pass
+
+        try:
+            fold_balances.append(balanced_accuracy_score(y_val_cv, maj_pred_cv))
+        except ValueError:
+            pass
+
+    return {
+        "cv_accuracy": float(np.mean(fold_accuracies)) if fold_accuracies else np.nan,
+        "cv_balanced_accuracy": float(np.nanmean(fold_balances)) if fold_balances else np.nan,
+        "cv_roc_auc": float(np.nanmean(fold_aucs)) if fold_aucs else np.nan,
+    }
 
 
 def train_and_evaluate(
@@ -278,6 +394,7 @@ def train_and_evaluate(
     model_name: str = "random_forest",
     top_n: int = 10,
     ensemble: bool = False,
+    cv_splits: int = 5,
 ) -> dict:
     """Treina modelo(s) para cada dezena e avalia no último ano.
 
@@ -311,8 +428,8 @@ def train_and_evaluate(
     per_concurso_probas = {}  # {n: array of probabilities per test concurso}
 
     if ensemble:
-        model_names_used = ["random_forest", "gradient_boosting", "logistic_regression"]
-        print(f"\n   Treinando ENSEMBLE (RF + GB + LR) para cada dezena (1-{TOTAL_NUMBERS})...")
+        model_names_used = ["random_forest", "gradient_boosting", "logistic_regression", "xgboost"]
+        print(f"\n   Treinando ENSEMBLE (RF + GB + LR + XGBoost) para cada dezena (1-{TOTAL_NUMBERS})...")
     else:
         model_names_used = [model_name]
         print(f"\n   Treinando modelos para cada dezena (1-{TOTAL_NUMBERS})...")
@@ -346,8 +463,43 @@ def train_and_evaluate(
         majority_pred = (np.mean(all_preds, axis=0) >= 0.5).astype(int)
         acc = accuracy_score(y_test, majority_pred)
 
+        cv_results = _compute_time_series_cv(
+            X_train,
+            y_train,
+            model_names_used,
+            cv_splits=cv_splits,
+            ensemble=ensemble,
+        )
+
+        try:
+            balanced_acc = balanced_accuracy_score(y_test, majority_pred)
+        except ValueError:
+            balanced_acc = np.nan
+
+        try:
+            precision = precision_score(y_test, majority_pred, zero_division=0)
+        except ValueError:
+            precision = np.nan
+
+        try:
+            recall = recall_score(y_test, majority_pred, zero_division=0)
+        except ValueError:
+            recall = np.nan
+
+        try:
+            roc_auc = roc_auc_score(y_test, avg_proba_col)
+        except ValueError:
+            roc_auc = np.nan
+
         results_per_number[n] = {
             "accuracy": acc,
+            "balanced_accuracy": balanced_acc,
+            "precision": precision,
+            "recall": recall,
+            "roc_auc": roc_auc,
+            "cv_accuracy": cv_results["cv_accuracy"],
+            "cv_balanced_accuracy": cv_results["cv_balanced_accuracy"],
+            "cv_roc_auc": cv_results["cv_roc_auc"],
             "avg_probability": avg_proba,
             "actual_frequency": float(np.mean(y_test)),
             "predicted_frequency": float(np.mean(majority_pred)),
@@ -364,6 +516,7 @@ def train_and_evaluate(
         "feature_columns": feature_cols,
         "per_concurso_probas": per_concurso_probas,
         "ensemble": ensemble,
+        "cv_splits": cv_splits,
     }
 
 
@@ -400,14 +553,18 @@ def analyze_last_year(
     actual_top = {n for n, _ in most_common_actual}
     predicted_top = set(top_numbers)
     overlap = actual_top & predicted_top
+    total_draws = len(test_concursos) * 6
+    top_k_recall = hits / total_draws if total_draws > 0 else 0.0
 
     return {
+        "top_k": top_n,
         "top_predicted": top_numbers,
         "top_actual": most_common_actual,
         "overlap": overlap,
         "overlap_count": len(overlap),
         "hits_in_test": hits,
-        "total_draws": len(test_concursos) * 6,
+        "total_draws": total_draws,
+        "top_k_recall": top_k_recall,
         "test_concursos_count": len(test_concursos),
     }
 
@@ -556,8 +713,8 @@ def print_report(results: dict, analysis: dict, train_size: int, test_size: int)
     print("   RELATÓRIO DE ANÁLISE - MEGA SENA")
     print("=" * 60)
 
-    print(f"\n   Período de treino: março 2020 - dezembro 2025 ({train_size} concursos)")
-    print(f"   Período de teste:  janeiro 2026 - abril 2026 ({test_size} concursos)")
+    print(f"\n   Período de treino: janeiro 2000 - dezembro 2020 ({train_size} concursos)")
+    print(f"   Período de teste:  janeiro 2021 - dezembro 2026 ({test_size} concursos)")
 
     print("\n" + "-" * 60)
     print("   TOP 10 DEZENAS MAIS PROVÁVEIS (previsão do modelo)")
@@ -575,9 +732,10 @@ def print_report(results: dict, analysis: dict, train_size: int, test_size: int)
     print("\n" + "-" * 60)
     print("   COMPARAÇÃO: PREVISÃO vs REALIDADE")
     print("-" * 60)
-    print(f"   Dezenas previstas no top 10:  {sorted(analysis['top_predicted'])}")
-    print(f"   Dezenas reais no top 10:      {sorted([n for n, _ in analysis['top_actual']])}")
-    print(f"   Acertos (overlap):            {sorted(analysis['overlap'])} ({analysis['overlap_count']}/10)")
+    print(f"   Dezenas previstas no top {analysis['top_k']}:  {sorted(analysis['top_predicted'])}")
+    print(f"   Dezenas reais no top {analysis['top_k']}:      {sorted([n for n, _ in analysis['top_actual']])}")
+    print(f"   Acertos (overlap):            {sorted(analysis['overlap'])} ({analysis['overlap_count']}/{analysis['top_k']})")
+    print(f"   Top-{analysis['top_k']} recall no teste:    {analysis['top_k_recall']:.4f}")
 
     print("\n" + "-" * 60)
     print("   DEZENAS MENOS PROVÁVEIS (frias)")
@@ -587,12 +745,23 @@ def print_report(results: dict, analysis: dict, train_size: int, test_size: int)
         print(f"   {i:2d}. Dezena {n:02d}  |  Probabilidade: {prob:.4f}  |  Freq. real no teste: {actual_freq:.4f}")
 
     accuracies = [r["accuracy"] for r in results["results_per_number"].values()]
+    cv_accuracies = [r["cv_accuracy"] for r in results["results_per_number"].values() if not np.isnan(r["cv_accuracy"])]
+    cv_balanced_accuracies = [r["cv_balanced_accuracy"] for r in results["results_per_number"].values() if not np.isnan(r["cv_balanced_accuracy"])]
+    cv_aucs = [r["cv_roc_auc"] for r in results["results_per_number"].values() if not np.isnan(r["cv_roc_auc"])]
+    balanced_accuracies = [r["balanced_accuracy"] for r in results["results_per_number"].values() if not np.isnan(r["balanced_accuracy"])]
     print("\n" + "-" * 60)
     print("   MÉTRICAS GERAIS")
     print("-" * 60)
-    print(f"   Acurácia média dos modelos:  {np.mean(accuracies):.4f}")
-    print(f"   Acurácia mínima:             {np.min(accuracies):.4f}")
-    print(f"   Acurácia máxima:             {np.max(accuracies):.4f}")
+    print(f"   Acurácia média dos modelos:            {np.mean(accuracies):.4f}")
+    print(f"   Acurácia mínima:                       {np.min(accuracies):.4f}")
+    print(f"   Acurácia máxima:                       {np.max(accuracies):.4f}")
+    print(f"   Balanced Accuracy média dos modelos:   {np.mean(balanced_accuracies):.4f}")
+    if cv_accuracies:
+        print(f"   Acurácia média CV (TimeSeriesSplit):    {np.mean(cv_accuracies):.4f}")
+    if cv_balanced_accuracies:
+        print(f"   Balanced Accuracy média CV:             {np.mean(cv_balanced_accuracies):.4f}")
+    if cv_aucs:
+        print(f"   ROC AUC média CV:                      {np.mean(cv_aucs):.4f}")
     print(f"   Total de concursos analisados no teste: {analysis['test_concursos_count']}")
 
     print("\n" + "=" * 60)
@@ -711,6 +880,7 @@ def run_mega_sena_analysis(
     save: bool = False,
     window: int = 30,
     ensemble: bool = False,
+    cv_splits: int = 5,
 ) -> dict:
     """Executa a análise completa da Mega Sena.
 
@@ -759,8 +929,8 @@ def run_mega_sena_analysis(
     print("3. DIVISÃO TEMPORAL DOS DADOS")
     print("=" * 60)
     train_df, test_df = split_by_date(df, features_df)
-    print(f"   Treino (2000-2025):  {len(train_df)} concursos")
-    print(f"   Teste (2026):        {len(test_df)} concursos")
+    print(f"   Treino (2000-2020):  {len(train_df)} concursos")
+    print(f"   Teste (2021-2026):    {len(test_df)} concursos")
     print(f"   Corte temporal: {CUTOFF_DATE.strftime('%d/%m/%Y')}")
 
     # 5. Treinar e avaliar
@@ -773,7 +943,14 @@ def run_mega_sena_analysis(
         print("   Votação: soft voting (média de probabilidades)")
     else:
         print(f"   Modelo: {model_name}")
-    results = train_and_evaluate(train_df, test_df, model_name=model_name, ensemble=ensemble)
+    print(f"   TimeSeriesSplit no treino: {cv_splits} folds")
+    results = train_and_evaluate(
+        train_df,
+        test_df,
+        model_name=model_name,
+        ensemble=ensemble,
+        cv_splits=cv_splits,
+    )
 
     # 6. Análise por dezena
     print("\n" + "=" * 60)
@@ -818,9 +995,9 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="random_forest",
+        default="xgboost",
         choices=list(MODELS.keys()),
-        help="Modelo de ML a ser usado (default: random_forest)",
+        help="Modelo de ML a ser usado (default: xgboost)",
     )
     parser.add_argument(
         "--window",
@@ -843,6 +1020,12 @@ def main():
         action="store_true",
         help="Salvar gráficos e modelo treinado",
     )
+    parser.add_argument(
+        "--cv-splits",
+        type=int,
+        default=5,
+        help="Número de folds do TimeSeriesSplit no conjunto de treino",
+    )
 
     args = parser.parse_args()
 
@@ -852,6 +1035,7 @@ def main():
         save=args.save,
         window=args.window,
         ensemble=args.ensemble,
+        cv_splits=args.cv_splits,
     )
 
 
