@@ -1,80 +1,35 @@
-"""Probability calibration utilities for better reliability estimates."""
-
 import numpy as np
-from sklearn.calibration import calibration_curve, CalibratedClassifierCV
-from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
 
 
-def calibrate_model(model, X_val: np.ndarray, y_val: np.ndarray, method: str = "isotonic"):
-    """Calibrate a trained model's probabilities using a held-out validation set.
+def calibrate_model(model, X: np.ndarray, y: np.ndarray, method: str = "isotonic", cv: int = 3):
+    """Aplica calibração isotônica para tornar probabilidades mais confiáveis."""
+    if len(np.unique(y)) < 2:
+        return model
 
-    Args:
-        model: Trained sklearn-compatible classifier.
-        X_val: Validation features.
-        y_val: Validation labels.
-        method: Calibration method ('isotonic' or 'sigmoid').
-
-    Returns:
-        Calibrated classifier.
-    """
-    calibrated = CalibratedClassifierCV(
-        estimator=model,
-        method=method,
-        cv="prefit",
-    )
-    calibrated.fit(X_val, y_val)
-    return calibrated
+    calibrated = CalibratedClassifierCV(model, cv=cv, method=method)
+    return calibrated.fit(X, y)
 
 
-def expected_calibration_error(
-    y_true: np.ndarray,
-    y_proba: np.ndarray,
-    n_bins: int = 10,
-) -> float:
-    """Compute Expected Calibration Error (ECE).
+def expected_calibration_error(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> float:
+    """Calcula o Expected Calibration Error (ECE)."""
+    if len(y_prob) == 0:
+        return np.nan
 
-    Lower ECE means better-calibrated probabilities.
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    total = len(y_prob)
 
-    Args:
-        y_true: True binary labels.
-        y_proba: Predicted probabilities.
-        n_bins: Number of calibration bins.
+    for i in range(n_bins):
+        mask = (y_prob >= bins[i]) & (y_prob < bins[i + 1])
+        if i == n_bins - 1:
+            mask = (y_prob >= bins[i]) & (y_prob <= bins[i + 1])
 
-    Returns:
-        ECE value (0 = perfect, 1 = worst).
-    """
-    prob_true, prob_pred = calibration_curve(y_true, y_proba, n_bins=n_bins, strategy="uniform")
-    ece = float(np.mean(np.abs(prob_true - prob_pred)))
-    return ece
+        if np.sum(mask) == 0:
+            continue
 
+        avg_prob = np.mean(y_prob[mask])
+        avg_true = np.mean(y_true[mask])
+        ece += (np.sum(mask) / total) * abs(avg_prob - avg_true)
 
-def reliability_summary(
-    y_true: np.ndarray,
-    y_proba: np.ndarray,
-    n_bins: int = 10,
-) -> dict:
-    """Compute calibration reliability summary.
-
-    Args:
-        y_true: True binary labels.
-        y_proba: Predicted probabilities.
-        n_bins: Number of calibration bins.
-
-    Returns:
-        Dictionary with calibration stats.
-    """
-    try:
-        prob_true, prob_pred = calibration_curve(y_true, y_proba, n_bins=n_bins, strategy="uniform")
-        ece = float(np.mean(np.abs(prob_true - prob_pred)))
-        max_error = float(np.max(np.abs(prob_true - prob_pred)))
-        overconf = float(np.mean(prob_pred - prob_true))
-    except ValueError:
-        ece = float("nan")
-        max_error = float("nan")
-        overconf = float("nan")
-
-    return {
-        "ece": ece,
-        "max_calibration_error": max_error,
-        "overconfidence": overconf,
-    }
+    return float(ece)
