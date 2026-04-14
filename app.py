@@ -1,11 +1,19 @@
 """
-app.py - v3 com LightGBM
+app.py - v4
+Pipeline de Machine Learning para análise da Mega Sena mantendo a estrutura
+original (1 linha por concurso + 60 targets), mas trocando o treinamento
+por dezena para LightGBM.
 
-Pipeline de Machine Learning para análise da Mega Sena com:
-- LightGBM como modelo principal
-- métricas impressas no terminal
-- ranking top-6 por concurso
-- ensemble opcional (LightGBM + LogisticRegression)
+Melhorias:
+1. Mantém a lógica original que vinha entregando baseline melhor
+2. Usa LightGBM por dezena
+3. Ensemble opcional: LightGBM + LogisticRegression
+4. Métricas por print:
+   - accuracy / precision / recall / auc / brier por dezena
+   - hit_rate top-6
+   - avg_hits_per_game
+   - % jogos >=1, >=2, >=3 acertos
+   - lift vs aleatório
 """
 
 import argparse
@@ -15,7 +23,6 @@ from collections import Counter
 
 import numpy as np
 import pandas as pd
-
 from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -45,145 +52,157 @@ DEZENA_COLS = [
 
 
 def load_mega_sena(filepath: Path) -> pd.DataFrame:
+    """Carrega os dados e converte a data."""
     df = pd.read_csv(filepath)
     df["data_parsed"] = pd.to_datetime(df["data"], format="%d/%m/%Y")
     df = df.sort_values("concurso").reset_index(drop=True)
     return df
 
 
-def _get_recent_draws(all_draws: np.ndarray, i: int, window: int) -> np.ndarray:
-    start = max(0, i - window)
-    return all_draws[start:i]
-
-
-def _build_window_features(recent_draws: np.ndarray, n: int, suffix: str) -> dict:
-    if len(recent_draws) == 0:
-        return {
-            f"freq_{suffix}_{n}": 0.0,
-            f"delay_{suffix}_{n}": 0.0,
-            f"streak_{suffix}_{n}": 0.0,
-        }
-
-    flat = recent_draws.flatten()
-    freq = np.sum(flat == n) / len(recent_draws)
-
-    last_seen = -1
-    for j in range(len(recent_draws) - 1, -1, -1):
-        if n in recent_draws[j]:
-            last_seen = j
-            break
-    delay = (len(recent_draws) - last_seen) if last_seen >= 0 else (len(recent_draws) + 1)
-
-    streak = 0
-    for j in range(len(recent_draws) - 1, -1, -1):
-        if n in recent_draws[j]:
-            streak += 1
-        else:
-            break
-
-    return {
-        f"freq_{suffix}_{n}": float(freq),
-        f"delay_{suffix}_{n}": float(delay),
-        f"streak_{suffix}_{n}": float(streak),
-    }
-
-
-def _build_global_context_features(last_draw: list[int], recent_draws: np.ndarray) -> dict:
-    soma_ultimo = int(np.sum(last_draw))
-    pares_ultimo = int(np.sum(np.array(last_draw) % 2 == 0))
-    impares_ultimo = 6 - pares_ultimo
-
-    somas = [int(np.sum(d)) for d in recent_draws] if len(recent_draws) > 0 else [0]
-    soma_media = float(np.mean(somas))
-    soma_std = float(np.std(somas))
-
-    consecutivas = sum(
-        1 for k in range(len(last_draw) - 1)
-        if last_draw[k + 1] - last_draw[k] == 1
-    )
-
-    q1 = sum(1 for n in last_draw if 1 <= n <= 15)
-    q2 = sum(1 for n in last_draw if 16 <= n <= 30)
-    q3 = sum(1 for n in last_draw if 31 <= n <= 45)
-    q4 = sum(1 for n in last_draw if 46 <= n <= 60)
-
-    gaps = [last_draw[k + 1] - last_draw[k] for k in range(len(last_draw) - 1)]
-    gap_medio = float(np.mean(gaps)) if gaps else 0.0
-    gap_max = float(max(gaps)) if gaps else 0.0
-    gap_min = float(min(gaps)) if gaps else 0.0
-    gap_std = float(np.std(gaps)) if len(gaps) > 1 else 0.0
-
-    amplitude = float(last_draw[-1] - last_draw[0])
-    mediana = float(np.median(last_draw))
-
-    decadas = {}
-    for dec in range(6):
-        low = dec * 10 + 1
-        high = (dec + 1) * 10
-        decadas[f"decada_{low}_{high}"] = sum(1 for n in last_draw if low <= n <= high)
-
-    return {
-        "soma_ultimo": soma_ultimo,
-        "pares_ultimo": pares_ultimo,
-        "impares_ultimo": impares_ultimo,
-        "soma_media_janela": soma_media,
-        "soma_std_janela": soma_std,
-        "consecutivas": consecutivas,
-        "quadrante_1_15": q1,
-        "quadrante_16_30": q2,
-        "quadrante_31_45": q3,
-        "quadrante_46_60": q4,
-        "gap_medio": gap_medio,
-        "gap_max": gap_max,
-        "gap_min": gap_min,
-        "gap_std": gap_std,
-        "amplitude": amplitude,
-        "mediana": mediana,
-        **decadas,
-    }
-
-
-def build_frequency_features(
-    df: pd.DataFrame,
-    min_window: int = 30,
-    windows: tuple[int, ...] = (5, 10, 20, 30, 60, 120),
-) -> pd.DataFrame:
+def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame:
+    """
+    Calcula features por concurso usando apenas histórico até o concurso anterior.
+    Mantém o desenho original do pipeline.
+    """
     all_draws = df[DEZENA_COLS].values.astype(int)
     features_list = []
 
-    for i in range(min_window, len(df)):
-        recent_base = _get_recent_draws(all_draws, i, min_window)
-        last_draw = sorted(all_draws[i - 1].tolist())
+    for i in range(window, len(df)):
+        recent_draws = all_draws[max(0, i - window):i]
+        recent_numbers = recent_draws.flatten()
 
-        row = {
-            "concurso": df.iloc[i]["concurso"],
-            "idx": i,
-        }
-
-        row.update(_build_global_context_features(last_draw, recent_base))
-
+        # Frequência por dezena
+        freq_features = {}
         for n in range(1, TOTAL_NUMBERS + 1):
-            for w in windows:
-                recent_draws = _get_recent_draws(all_draws, i, w)
-                row.update(_build_window_features(recent_draws, n, suffix=f"w{w}"))
+            freq_features[f"freq_{n}"] = float(np.sum(recent_numbers == n) / len(recent_draws))
 
-            row[f"trend_10_60_{n}"] = row.get(f"freq_w10_{n}", 0.0) - row.get(f"freq_w60_{n}", 0.0)
-            row[f"trend_20_120_{n}"] = row.get(f"freq_w20_{n}", 0.0) - row.get(f"freq_w120_{n}", 0.0)
-            row[f"is_even_{n}"] = 1 if n % 2 == 0 else 0
-            row[f"bucket_decade_{n}"] = int((n - 1) // 10) + 1
-            row[f"quadrant_num_{n}"] = (
-                1 if 1 <= n <= 15 else
-                2 if 16 <= n <= 30 else
-                3 if 31 <= n <= 45 else
-                4
+        # Atraso por dezena
+        delay_features = {}
+        for n in range(1, TOTAL_NUMBERS + 1):
+            last_seen = -1
+            for j in range(len(recent_draws) - 1, -1, -1):
+                if n in recent_draws[j]:
+                    last_seen = j
+                    break
+            delay_features[f"atraso_{n}"] = float(
+                (len(recent_draws) - last_seen) if last_seen >= 0 else (window + 1)
             )
 
+        # Streak por dezena
+        streak_features = {}
+        for n in range(1, TOTAL_NUMBERS + 1):
+            streak = 0
+            for j in range(len(recent_draws) - 1, -1, -1):
+                if n in recent_draws[j]:
+                    streak += 1
+                else:
+                    break
+            streak_features[f"streak_{n}"] = float(streak)
+
+        # Multi-window leve, ainda no mesmo desenho
+        multi_window_features = {}
+        for n in range(1, TOTAL_NUMBERS + 1):
+            for w in (5, 10, 20, 30, 60):
+                subset = all_draws[max(0, i - w):i]
+                if len(subset) == 0:
+                    freq = 0.0
+                    delay = float(w + 1)
+                else:
+                    flat = subset.flatten()
+                    freq = float(np.sum(flat == n) / len(subset))
+
+                    last_seen = -1
+                    for j in range(len(subset) - 1, -1, -1):
+                        if n in subset[j]:
+                            last_seen = j
+                            break
+                    delay = float((len(subset) - last_seen) if last_seen >= 0 else (w + 1))
+
+                multi_window_features[f"freq_w{w}_{n}"] = freq
+                multi_window_features[f"delay_w{w}_{n}"] = delay
+
+            multi_window_features[f"trend_10_60_{n}"] = (
+                multi_window_features[f"freq_w10_{n}"] - multi_window_features[f"freq_w60_{n}"]
+            )
+
+        # Contexto do último concurso
+        last_draw = sorted(all_draws[i - 1].tolist())
+        soma_ultimo = int(np.sum(last_draw))
+        pares_ultimo = int(np.sum(np.array(last_draw) % 2 == 0))
+        impares_ultimo = 6 - pares_ultimo
+
+        somas = [int(np.sum(d)) for d in recent_draws]
+        soma_media = float(np.mean(somas))
+        soma_std = float(np.std(somas))
+
+        consecutivas = sum(
+            1 for k in range(len(last_draw) - 1)
+            if last_draw[k + 1] - last_draw[k] == 1
+        )
+
+        q1 = sum(1 for n in last_draw if 1 <= n <= 15)
+        q2 = sum(1 for n in last_draw if 16 <= n <= 30)
+        q3 = sum(1 for n in last_draw if 31 <= n <= 45)
+        q4 = sum(1 for n in last_draw if 46 <= n <= 60)
+
+        gaps = [last_draw[k + 1] - last_draw[k] for k in range(len(last_draw) - 1)]
+        gap_medio = float(np.mean(gaps)) if gaps else 0.0
+        gap_max = float(max(gaps)) if gaps else 0.0
+        gap_min = float(min(gaps)) if gaps else 0.0
+        gap_std = float(np.std(gaps)) if len(gaps) > 1 else 0.0
+
+        decadas = {}
+        for dec in range(6):
+            low = dec * 10 + 1
+            high = (dec + 1) * 10
+            decadas[f"decada_{low}_{high}"] = sum(1 for n in last_draw if low <= n <= high)
+
+        hot_count = sum(
+            1 for n in range(1, TOTAL_NUMBERS + 1)
+            if freq_features[f"freq_{n}"] > 0.12
+        )
+        cold_count = sum(
+            1 for n in range(1, TOTAL_NUMBERS + 1)
+            if freq_features[f"freq_{n}"] < 0.08
+        )
+
+        amplitude = float(last_draw[-1] - last_draw[0])
+        mediana = float(np.median(last_draw))
+
+        row = {
+            "concurso": int(df.iloc[i]["concurso"]),
+            "idx": i,
+            **freq_features,
+            **delay_features,
+            **streak_features,
+            **multi_window_features,
+            **decadas,
+            "soma_ultimo": soma_ultimo,
+            "pares_ultimo": pares_ultimo,
+            "impares_ultimo": impares_ultimo,
+            "soma_media_janela": soma_media,
+            "soma_std_janela": soma_std,
+            "consecutivas": consecutivas,
+            "quadrante_1_15": q1,
+            "quadrante_16_30": q2,
+            "quadrante_31_45": q3,
+            "quadrante_46_60": q4,
+            "gap_medio": gap_medio,
+            "gap_max": gap_max,
+            "gap_min": gap_min,
+            "gap_std": gap_std,
+            "hot_count": hot_count,
+            "cold_count": cold_count,
+            "amplitude": amplitude,
+            "mediana": mediana,
+        }
         features_list.append(row)
 
     return pd.DataFrame(features_list)
 
 
 def build_target(df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
+    """Cria target_1 ... target_60."""
     for n in range(1, TOTAL_NUMBERS + 1):
         targets = []
         for _, row in features_df.iterrows():
@@ -195,6 +214,7 @@ def build_target(df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def split_by_date(df_original: pd.DataFrame, features_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Divide treino e teste por data."""
     features_df = features_df.merge(
         df_original[["concurso", "data_parsed"]],
         on="concurso",
@@ -206,25 +226,27 @@ def split_by_date(df_original: pd.DataFrame, features_df: pd.DataFrame) -> tuple
 
 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
+    """Retorna colunas de features."""
     exclude = {"concurso", "idx", "data_parsed"}
     target_cols = {c for c in df.columns if c.startswith("target_")}
     return [c for c in df.columns if c not in exclude and c not in target_cols]
 
 
 def _build_single_model(model_name: str):
+    """Cria modelo."""
     if model_name == "lightgbm":
         return LGBMClassifier(
             objective="binary",
-            n_estimators=300,
+            n_estimators=350,
             learning_rate=0.03,
             num_leaves=31,
             max_depth=6,
             min_child_samples=20,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            subsample=0.85,
+            colsample_bytree=0.85,
             reg_alpha=0.2,
             reg_lambda=0.2,
-            class_weight="balanced",
+            class_weight={0: 1.0, 1: 9.0},
             random_state=42,
             verbosity=-1,
         )
@@ -243,13 +265,14 @@ def _build_single_model(model_name: str):
 
 
 def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    unique = np.unique(y_true)
-    if len(unique) < 2:
+    """Calcula AUC quando possível."""
+    if len(np.unique(y_true)) < 2:
         return float("nan")
     return float(roc_auc_score(y_true, y_score))
 
 
 def _safe_brier(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Calcula Brier quando possível."""
     try:
         return float(brier_score_loss(y_true, y_prob))
     except Exception:
@@ -262,6 +285,9 @@ def train_and_evaluate(
     model_name: str = "lightgbm",
     ensemble: bool = False,
 ) -> dict:
+    """
+    Treina 1 modelo por dezena, mantendo a estrutura original.
+    """
     feature_cols = get_feature_columns(train_df)
     X_train_raw = train_df[feature_cols].values
     X_test_raw = test_df[feature_cols].values
@@ -277,11 +303,11 @@ def train_and_evaluate(
     if ensemble:
         model_names_used = ["lightgbm", "logistic_regression"]
         weights = np.array([0.85, 0.15], dtype=float)
-        print("\nTreinando ensemble ponderado: LightGBM(0.85) + LogisticRegression(0.15)")
+        print("\nTreinando ensemble: LightGBM(0.85) + LogisticRegression(0.15)")
     else:
         model_names_used = [model_name]
         weights = np.array([1.0], dtype=float)
-        print(f"\nTreinando modelo: {model_name}")
+        print(f"\nTreinando modelo por dezena: {model_name}")
 
     for n in range(1, TOTAL_NUMBERS + 1):
         target_col = f"target_{n}"
@@ -311,6 +337,8 @@ def train_and_evaluate(
 
         avg_proba_col = np.average(model_prob_cols, axis=0, weights=weights)
         avg_proba = float(np.mean(avg_proba_col))
+
+        # Predição hard apenas para métricas por dezena
         hard_vote_pred = (np.mean(model_pred_cols, axis=0) >= 0.5).astype(int)
 
         acc = float(accuracy_score(y_test, hard_vote_pred))
@@ -345,6 +373,7 @@ def train_and_evaluate(
 
 
 def analyze_last_year(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, top_n: int = 10) -> dict:
+    """Analisa top previstas vs top reais no período de teste."""
     ranking = results["ranking"]
     top_numbers = [n for n, _ in ranking[:top_n]]
 
@@ -372,6 +401,9 @@ def analyze_last_year(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, to
 
 
 def predict_full_games(df: pd.DataFrame, test_df: pd.DataFrame, results: dict) -> dict:
+    """
+    Para cada concurso de teste, pega as 6 dezenas com maior probabilidade.
+    """
     per_concurso_probas = results["per_concurso_probas"]
     test_concursos = test_df["concurso"].values
     num_test = len(test_concursos)
@@ -412,9 +444,9 @@ def predict_full_games(df: pd.DataFrame, test_df: pd.DataFrame, results: dict) -
 
     hit_rate = (total_hits / total_numbers) if total_numbers > 0 else 0.0
     avg_hits_per_game = (total_hits / num_test) if num_test > 0 else 0.0
-    pct_ge_1 = np.mean([h >= 1 for h in hits_list]) if hits_list else 0.0
-    pct_ge_2 = np.mean([h >= 2 for h in hits_list]) if hits_list else 0.0
-    pct_ge_3 = np.mean([h >= 3 for h in hits_list]) if hits_list else 0.0
+    pct_ge_1 = float(np.mean([h >= 1 for h in hits_list])) if hits_list else 0.0
+    pct_ge_2 = float(np.mean([h >= 2 for h in hits_list])) if hits_list else 0.0
+    pct_ge_3 = float(np.mean([h >= 3 for h in hits_list])) if hits_list else 0.0
     lift = (hit_rate / BASELINE_RANDOM_HIT_RATE) if BASELINE_RANDOM_HIT_RATE > 0 else 0.0
 
     return {
@@ -426,14 +458,15 @@ def predict_full_games(df: pd.DataFrame, test_df: pd.DataFrame, results: dict) -
         "hit_rate": hit_rate,
         "hits_distribution": dict(sorted(hits_distribution.items())),
         "max_hits": max(hits_list) if hits_list else 0,
-        "pct_games_ge_1_hit": float(pct_ge_1),
-        "pct_games_ge_2_hits": float(pct_ge_2),
-        "pct_games_ge_3_hits": float(pct_ge_3),
+        "pct_games_ge_1_hit": pct_ge_1,
+        "pct_games_ge_2_hits": pct_ge_2,
+        "pct_games_ge_3_hits": pct_ge_3,
         "lift_vs_random": float(lift),
     }
 
 
 def print_model_metrics(results: dict) -> None:
+    """Imprime métricas agregadas dos 60 modelos."""
     rows = []
     for n, r in results["results_per_number"].items():
         rows.append({
@@ -474,10 +507,11 @@ def print_model_metrics(results: dict) -> None:
 
 
 def print_summary_report(results: dict, analysis: dict, prediction: dict, train_size: int, test_size: int) -> None:
+    """Imprime relatório principal."""
     ranking = results["ranking"]
 
     print("\n" + "=" * 90)
-    print("RELATÓRIO FINAL - MEGA SENA ML v3 (LIGHTGBM)")
+    print("RELATÓRIO FINAL - MEGA SENA ML v4 (LIGHTGBM POR DEZENA)")
     print("=" * 90)
 
     print(f"\nTreino: {train_size} concursos")
@@ -526,6 +560,7 @@ def print_summary_report(results: dict, analysis: dict, prediction: dict, train_
 
 
 def print_detailed_game_report(prediction: dict) -> None:
+    """Imprime detalhe por concurso."""
     print("\n" + "=" * 90)
     print("DETALHE POR CONCURSO")
     print("=" * 90)
@@ -540,9 +575,10 @@ def print_detailed_game_report(prediction: dict) -> None:
 
 def run_mega_sena_analysis(
     model_name: str = "lightgbm",
-    min_window: int = 30,
+    window: int = 30,
     ensemble: bool = False,
 ) -> dict:
+    """Executa pipeline completo."""
     print("=" * 90)
     print("1. CARREGANDO DADOS")
     print("=" * 90)
@@ -559,10 +595,10 @@ def run_mega_sena_analysis(
     print("\n" + "=" * 90)
     print("2. ENGENHARIA DE FEATURES")
     print("=" * 90)
-    print(f"Janela mínima: {min_window}")
-    print("Janelas usadas: 5, 10, 20, 30, 60, 120")
-    features_df = build_frequency_features(df, min_window=min_window)
+    print(f"Janela base: {window}")
+    features_df = build_frequency_features(df, window=window)
     print(f"Concursos com features: {len(features_df)}")
+    print(f"Features criadas: {len(get_feature_columns(features_df))}")
 
     print("\nConstruindo targets...")
     features_df = build_target(df, features_df)
@@ -606,7 +642,7 @@ def run_mega_sena_analysis(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ML Mega Sena v3 - LightGBM"
+        description="ML Mega Sena v4 - LightGBM por dezena com métricas por print"
     )
     parser.add_argument(
         "--model",
@@ -616,22 +652,22 @@ def main():
         help="Modelo a usar quando não estiver em ensemble",
     )
     parser.add_argument(
-        "--min-window",
+        "--window",
         type=int,
         default=30,
-        help="Janela mínima para começar a gerar features",
+        help="Janela base para features (default: 30)",
     )
     parser.add_argument(
         "--ensemble",
         action="store_true",
-        help="Usa ensemble ponderado LightGBM + LogisticRegression",
+        help="Usa ensemble LightGBM + LogisticRegression",
     )
 
     args = parser.parse_args()
 
     run_mega_sena_analysis(
         model_name=args.model,
-        min_window=args.min_window,
+        window=args.window,
         ensemble=args.ensemble,
     )
 
