@@ -1,19 +1,12 @@
 """
-app.py - v6.2
-Mega Sena ML focado em jogos fortes (terno / quadra / quina), usando:
+app.py - v6.3
+Mega Sena ML focado em jogos fortes, com:
 
-- treino por dezena
-- XGBoost como foco principal
-- presets selective/aggressive
-- geração padrão de 3 jogos concentrados
-- Monte Carlo adicional
-- benchmark automático de window + pool-size + preset
-- comparação automática entre cenários
-- relatório detalhado do melhor cenário
-
-Observação:
-- O script continua treinando como hoje.
-- A novidade é que ele compara múltiplos cenários automaticamente.
+- XGBoost selective como preset principal
+- benchmark reduzido para os cenários mais promissores
+- correção da seleção do melhor cenário
+- Monte Carlo com diversidade mínima entre jogos
+- exibição do local de sorteio quando houver 4+ acertos
 """
 
 import argparse
@@ -63,6 +56,10 @@ def load_mega_sena(filepath: Path) -> pd.DataFrame:
     df["data_parsed"] = pd.to_datetime(df["data"], format="%d/%m/%Y")
     df = df.sort_values("concurso").reset_index(drop=True)
     return df
+
+
+def get_draw_location(row: pd.Series) -> str:
+    return str(row["local"]) if pd.notna(row["local"]) else "Local não disponível"
 
 
 def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame:
@@ -238,42 +235,22 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c not in exclude and c not in target_cols]
 
 
-def build_xgboost_model(preset: str = "aggressive") -> XGBClassifier:
-    if preset == "aggressive":
-        return XGBClassifier(
-            n_estimators=900,
-            learning_rate=0.02,
-            max_depth=6,
-            min_child_weight=2,
-            subsample=0.95,
-            colsample_bytree=0.95,
-            reg_alpha=0.03,
-            reg_lambda=0.7,
-            objective="binary:logistic",
-            eval_metric="logloss",
-            scale_pos_weight=12.0,
-            random_state=42,
-            n_jobs=-1,
-        )
-
-    if preset == "selective":
-        return XGBClassifier(
-            n_estimators=600,
-            learning_rate=0.025,
-            max_depth=4,
-            min_child_weight=4,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_alpha=0.15,
-            reg_lambda=1.5,
-            objective="binary:logistic",
-            eval_metric="logloss",
-            scale_pos_weight=10.0,
-            random_state=42,
-            n_jobs=-1,
-        )
-
-    raise ValueError(f"Preset inválido: {preset}")
+def build_xgboost_model() -> XGBClassifier:
+    return XGBClassifier(
+        n_estimators=600,
+        learning_rate=0.025,
+        max_depth=4,
+        min_child_weight=4,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        reg_alpha=0.15,
+        reg_lambda=1.5,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        scale_pos_weight=10.0,
+        random_state=42,
+        n_jobs=-1,
+    )
 
 
 def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -289,11 +266,7 @@ def _safe_brier(y_true: np.ndarray, y_prob: np.ndarray) -> float:
         return float("nan")
 
 
-def train_and_evaluate(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    preset: str = "aggressive",
-) -> dict:
+def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
     feature_cols = get_feature_columns(train_df)
     X_train = train_df[feature_cols].values
     X_test = test_df[feature_cols].values
@@ -307,25 +280,19 @@ def train_and_evaluate(
         y_train = train_df[target_col].values
         y_test = test_df[target_col].values
 
-        model = build_xgboost_model(preset=preset)
+        model = build_xgboost_model()
         model.fit(X_train, y_train)
 
         y_pred = model.predict(X_test)
         y_proba = model.predict_proba(X_test)
         proba_col = y_proba[:, 1] if y_proba.shape[1] > 1 else y_proba[:, 0]
 
-        acc = float(accuracy_score(y_test, y_pred))
-        precision = float(precision_score(y_test, y_pred, zero_division=0))
-        recall = float(recall_score(y_test, y_pred, zero_division=0))
-        auc = _safe_auc(y_test, proba_col)
-        brier = _safe_brier(y_test, proba_col)
-
         results_per_number[n] = {
-            "accuracy": acc,
-            "precision": precision,
-            "recall": recall,
-            "auc": auc,
-            "brier": brier,
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "precision": float(precision_score(y_test, y_pred, zero_division=0)),
+            "recall": float(recall_score(y_test, y_pred, zero_division=0)),
+            "auc": _safe_auc(y_test, proba_col),
+            "brier": _safe_brier(y_test, proba_col),
             "avg_probability": float(np.mean(proba_col)),
             "actual_frequency": float(np.mean(y_test)),
             "predicted_frequency": float(np.mean(y_pred)),
@@ -341,7 +308,6 @@ def train_and_evaluate(
         "ranking": ranking,
         "feature_columns": feature_cols,
         "per_concurso_probas": per_concurso_probas,
-        "preset": preset,
     }
 
 
@@ -382,6 +348,38 @@ def _score_game_internal(game: list[int], ranked_pool: list[int]) -> float:
         score += 1.0 / pos
     score += len(set(game).intersection(set(ranked_pool[:4]))) * 0.15
     return score
+
+
+def _game_distance(g1: list[int], g2: list[int]) -> int:
+    return len(set(g1) ^ set(g2))
+
+
+def _select_diverse_games(candidate_games: dict[tuple, float], keep_games: int, min_distance: int = 4) -> list[list[int]]:
+    ordered = sorted(candidate_games.items(), key=lambda x: x[1], reverse=True)
+    selected = []
+
+    for game_tuple, _ in ordered:
+        game = list(game_tuple)
+        if not selected:
+            selected.append(game)
+            if len(selected) == keep_games:
+                break
+            continue
+
+        if all(_game_distance(game, prev) >= min_distance for prev in selected):
+            selected.append(game)
+            if len(selected) == keep_games:
+                break
+
+    if len(selected) < keep_games:
+        for game_tuple, _ in ordered:
+            game = list(game_tuple)
+            if game not in selected:
+                selected.append(game)
+                if len(selected) == keep_games:
+                    break
+
+    return [sorted(g) for g in selected[:keep_games]]
 
 
 def summarize_generated_games(
@@ -462,6 +460,7 @@ def predict_standard_games(
         original_row = df[df["concurso"] == concurso].iloc[0]
         actual_numbers = sorted(original_row[DEZENA_COLS].astype(int).values.tolist())
         data_jogo = original_row["data"]
+        local_jogo = get_draw_location(original_row)
 
         probas = {n: float(per_concurso_probas[n][i]) for n in range(1, TOTAL_NUMBERS + 1)}
         ranked_numbers = [n for n, _ in sorted(probas.items(), key=lambda x: x[1], reverse=True)]
@@ -482,6 +481,7 @@ def predict_standard_games(
             game = {
                 "concurso": concurso,
                 "data": data_jogo,
+                "local": local_jogo,
                 "game_id": idx_game,
                 "predicted": sorted(predicted_numbers),
                 "actual": actual_numbers,
@@ -501,6 +501,7 @@ def predict_standard_games(
         concursos_data.append({
             "concurso": concurso,
             "data": data_jogo,
+            "local": local_jogo,
             "actual": actual_numbers,
             "top_pool": top_pool,
             "games": game_results,
@@ -538,6 +539,7 @@ def predict_monte_carlo_games(
         original_row = df[df["concurso"] == concurso].iloc[0]
         actual_numbers = sorted(original_row[DEZENA_COLS].astype(int).values.tolist())
         data_jogo = original_row["data"]
+        local_jogo = get_draw_location(original_row)
 
         probas = {n: float(per_concurso_probas[n][i]) for n in range(1, TOTAL_NUMBERS + 1)}
         ranked_numbers = [n for n, _ in sorted(probas.items(), key=lambda x: x[1], reverse=True)]
@@ -553,9 +555,7 @@ def predict_monte_carlo_games(
             if key not in candidate_games or score > candidate_games[key]:
                 candidate_games[key] = score
 
-        selected_games = [
-            list(k) for k, _ in sorted(candidate_games.items(), key=lambda x: x[1], reverse=True)[:mc_keep_games]
-        ]
+        selected_games = _select_diverse_games(candidate_games, keep_games=mc_keep_games, min_distance=4)
 
         game_results = []
         best_game = None
@@ -570,6 +570,7 @@ def predict_monte_carlo_games(
             game = {
                 "concurso": concurso,
                 "data": data_jogo,
+                "local": local_jogo,
                 "game_id": idx_game,
                 "predicted": sorted(predicted_numbers),
                 "actual": actual_numbers,
@@ -589,6 +590,7 @@ def predict_monte_carlo_games(
         concursos_data.append({
             "concurso": concurso,
             "data": data_jogo,
+            "local": local_jogo,
             "actual": actual_numbers,
             "top_pool": top_pool,
             "games": game_results,
@@ -624,8 +626,9 @@ def print_games_with_matches(summary: dict, top_n: int = 20) -> None:
         return
 
     for g in matched_games[:top_n]:
+        extra_local = f" | Local {g['local']}" if g["hits"] >= 4 else ""
         print(
-            f"Concurso {g['concurso']} | Data {g['data']} | "
+            f"Concurso {g['concurso']} | Data {g['data']}{extra_local} | "
             f"Jogo #{g['game_id']} | "
             f"Acertos {g['hits']}/6 | Prize {g['prize_score']} | "
             f"Previsto {g['predicted']} | Real {g['actual']} | Match {g['matched']}"
@@ -674,7 +677,7 @@ def print_summary_metrics(summary: dict) -> None:
         print(f"{hits} acertos: {count}")
 
 
-def print_benchmark_table(benchmark_df: pd.DataFrame, top_n: int = 15) -> None:
+def print_benchmark_table(benchmark_df: pd.DataFrame, top_n: int = 12) -> None:
     print("\n" + "=" * 120)
     print("BENCHMARK AUTOMÁTICO DOS CENÁRIOS")
     print("=" * 120)
@@ -684,7 +687,7 @@ def print_benchmark_table(benchmark_df: pd.DataFrame, top_n: int = 15) -> None:
         return
 
     cols = [
-        "preset", "window", "pool_size", "mode",
+        "window", "pool_size", "mode",
         "num_quadras_best", "num_quinas_best",
         "max_hits_best", "best_prize_score_total",
         "avg_hits_best_games", "hit_rate_best_games"
@@ -697,40 +700,21 @@ def print_benchmark_table(benchmark_df: pd.DataFrame, top_n: int = 15) -> None:
 
     print(show_df.to_string(index=False))
 
-    best_prize = benchmark_df.sort_values(
-        by=["best_prize_score_total", "num_quinas_best", "num_quadras_best", "max_hits_best"],
-        ascending=False
-    ).iloc[0]
-
-    best_hits = benchmark_df.sort_values(
-        by=["max_hits_best", "num_quinas_best", "num_quadras_best", "best_prize_score_total"],
-        ascending=False
-    ).iloc[0]
-
-    print("\nMelhor cenário por prize score:")
-    print(best_prize.to_string())
-
-    print("\nMelhor cenário por maior acerto:")
-    print(best_hits.to_string())
-
 
 def run_single_scenario(
     df: pd.DataFrame,
     window: int,
     pool_size: int,
-    preset: str,
     mc_samples: int,
     mc_keep_games: int,
-    top_report: int,
-    detailed: bool = False,
 ) -> dict:
-    print(f"\nExecutando cenário -> preset={preset} | window={window} | pool={pool_size}")
+    print(f"\nExecutando cenário -> window={window} | pool={pool_size}")
 
     features_df = build_frequency_features(df, window=window)
     features_df = build_target(df, features_df)
     train_df, test_df = split_by_date(df, features_df)
 
-    results = train_and_evaluate(train_df=train_df, test_df=test_df, preset=preset)
+    results = train_and_evaluate(train_df=train_df, test_df=test_df)
 
     standard_summary = predict_standard_games(
         df=df,
@@ -748,12 +732,6 @@ def run_single_scenario(
         mc_keep_games=mc_keep_games,
     )
 
-    if detailed:
-        print_games_with_matches(standard_summary, top_n=top_report)
-        print_games_with_matches(monte_carlo_summary, top_n=top_report)
-        print_summary_metrics(standard_summary)
-        print_summary_metrics(monte_carlo_summary)
-
     return {
         "results": results,
         "standard_summary": standard_summary,
@@ -767,48 +745,42 @@ def run_benchmark(
     df: pd.DataFrame,
     windows: list[int],
     pools: list[int],
-    presets: list[str],
     mc_samples: int,
     mc_keep_games: int,
 ) -> tuple[pd.DataFrame, dict]:
     rows = []
     detailed_results = {}
 
-    for preset in presets:
-        for window in windows:
-            for pool_size in pools:
-                scenario_key = f"{preset}|w={window}|p={pool_size}"
-                scenario_result = run_single_scenario(
-                    df=df,
-                    window=window,
-                    pool_size=pool_size,
-                    preset=preset,
-                    mc_samples=mc_samples,
-                    mc_keep_games=mc_keep_games,
-                    top_report=20,
-                    detailed=False,
-                )
-                detailed_results[scenario_key] = scenario_result
+    for window in windows:
+        for pool_size in pools:
+            scenario_key = f"w={window}|p={pool_size}"
+            scenario_result = run_single_scenario(
+                df=df,
+                window=window,
+                pool_size=pool_size,
+                mc_samples=mc_samples,
+                mc_keep_games=mc_keep_games,
+            )
+            detailed_results[scenario_key] = scenario_result
 
-                for mode_name, summary in [
-                    ("standard", scenario_result["standard_summary"]),
-                    ("monte_carlo", scenario_result["monte_carlo_summary"]),
-                ]:
-                    rows.append({
-                        "scenario_key": scenario_key,
-                        "preset": preset,
-                        "window": window,
-                        "pool_size": pool_size,
-                        "mode": mode_name,
-                        "num_quadras_best": summary["num_quadras_best"],
-                        "num_quinas_best": summary["num_quinas_best"],
-                        "num_senas_best": summary["num_senas_best"],
-                        "max_hits_best": summary["max_hits_best"],
-                        "best_prize_score_total": summary["best_prize_score_total"],
-                        "avg_hits_best_games": summary["avg_hits_best_games"],
-                        "hit_rate_best_games": summary["hit_rate_best_games"],
-                        "num_ternos_best": summary["num_ternos_best"],
-                    })
+            for mode_name, summary in [
+                ("standard", scenario_result["standard_summary"]),
+                ("monte_carlo", scenario_result["monte_carlo_summary"]),
+            ]:
+                rows.append({
+                    "scenario_key": scenario_key,
+                    "window": window,
+                    "pool_size": pool_size,
+                    "mode": mode_name,
+                    "num_quadras_best": summary["num_quadras_best"],
+                    "num_quinas_best": summary["num_quinas_best"],
+                    "num_senas_best": summary["num_senas_best"],
+                    "max_hits_best": summary["max_hits_best"],
+                    "best_prize_score_total": summary["best_prize_score_total"],
+                    "avg_hits_best_games": summary["avg_hits_best_games"],
+                    "hit_rate_best_games": summary["hit_rate_best_games"],
+                    "num_ternos_best": summary["num_ternos_best"],
+                })
 
     benchmark_df = pd.DataFrame(rows)
     return benchmark_df, detailed_results
@@ -816,25 +788,19 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ML Mega Sena v6.2 - XGBoost benchmark automático + Monte Carlo"
+        description="ML Mega Sena v6.3 - XGBoost selective + benchmark reduzido + local de sorteio"
     )
     parser.add_argument(
         "--windows",
         type=str,
-        default="12,15,20,30",
-        help='Lista de windows separadas por vírgula. Ex: "12,15,20,30"',
+        default="15,30",
+        help='Lista de windows separadas por vírgula. Ex: "15,30"',
     )
     parser.add_argument(
         "--pools",
         type=str,
-        default="7,8,9,10",
-        help='Lista de pool-sizes separadas por vírgula. Ex: "7,8,9,10"',
-    )
-    parser.add_argument(
-        "--presets",
-        type=str,
-        default="selective,aggressive",
-        help='Lista de presets separadas por vírgula. Ex: "selective,aggressive"',
+        default="8,9",
+        help='Lista de pool-sizes separadas por vírgula. Ex: "8,9"',
     )
     parser.add_argument(
         "--mc-samples",
@@ -870,28 +836,26 @@ def main():
 
     windows = [int(x.strip()) for x in args.windows.split(",") if x.strip()]
     pools = [int(x.strip()) for x in args.pools.split(",") if x.strip()]
-    presets = [x.strip() for x in args.presets.split(",") if x.strip()]
 
     print("=" * 100)
-    print("MEGA SENA ML v6.2 - BENCHMARK AUTOMÁTICO")
+    print("MEGA SENA ML v6.3 - BENCHMARK REDUZIDO")
     print("=" * 100)
     print(f"Concursos carregados: {len(df)}")
     print(f"Período: {df['data'].iloc[0]} até {df['data'].iloc[-1]}")
     print(f"Windows testadas: {windows}")
     print(f"Pools testados:   {pools}")
-    print(f"Presets testados: {presets}")
+    print(f"Preset:           selective")
     print(f"Monte Carlo:      {args.mc_samples} amostras / {args.mc_keep_games} jogos mantidos")
 
     benchmark_df, detailed_results = run_benchmark(
         df=df,
         windows=windows,
         pools=pools,
-        presets=presets,
         mc_samples=args.mc_samples,
         mc_keep_games=args.mc_keep_games,
     )
 
-    print_benchmark_table(benchmark_df, top_n=20)
+    print_benchmark_table(benchmark_df, top_n=10)
 
     if args.show_best_details and not benchmark_df.empty:
         best_row = benchmark_df.sort_values(
