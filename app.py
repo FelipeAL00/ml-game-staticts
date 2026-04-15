@@ -1,5 +1,5 @@
 """
-app.py - v6
+app.py - v6.1
 Mega Sena ML focado em jogos fortes (terno / quadra / quina), usando:
 
 - estrutura original por concurso
@@ -7,12 +7,15 @@ Mega Sena ML focado em jogos fortes (terno / quadra / quina), usando:
 - LightGBM, XGBoost ou ensemble_gbm
 - ensemble por ranking entre LightGBM + XGBoost
 - geração de 3 jogos concentrados por concurso
+- Monte Carlo como recurso adicional
 - pool-size configurável
-- métricas de premiação e acertos fortes via print()
+- prints reorganizados:
+  1) jogos com match primeiro
+  2) métricas depois
 
-Objetivo:
-- menos foco em acurácia média
-- mais foco em jogos explosivos
+Observação:
+- O número de jogos mostrados no relatório NÃO é o total gerado.
+- O total gerado = concursos de teste × jogos por concurso.
 """
 
 import argparse
@@ -51,10 +54,10 @@ PRIZE_SCORE = {
     0: 0,
     1: 0,
     2: 0,
-    3: 1,     # terno
-    4: 5,     # quadra
-    5: 20,    # quina
-    6: 100,   # sena
+    3: 1,
+    4: 10,
+    5: 50,
+    6: 500,
 }
 
 
@@ -293,12 +296,6 @@ def train_and_evaluate(
     model_name: str = "lightgbm",
     rank_weights: tuple[float, float] = (0.5, 0.5),
 ) -> dict:
-    """
-    Treina por dezena usando:
-    - lightgbm
-    - xgboost
-    - ensemble_gbm (ranking ensemble)
-    """
     feature_cols = get_feature_columns(train_df)
     X_train = train_df[feature_cols].values
     X_test = test_df[feature_cols].values
@@ -346,12 +343,10 @@ def train_and_evaluate(
             proba_lgbm_col = proba_lgbm[:, 1] if proba_lgbm.shape[1] > 1 else proba_lgbm[:, 0]
             proba_xgb_col = proba_xgb[:, 1] if proba_xgb.shape[1] > 1 else proba_xgb[:, 0]
 
-            # Média de probabilidade apenas para métricas auxiliares
             proba_col = (proba_lgbm_col + proba_xgb_col) / 2.0
             pred_col = (proba_col >= 0.5).astype(int)
             model_store = {"lightgbm": model_lgbm, "xgboost": model_xgb}
 
-            # Guardar probas individuais para ranking ensemble depois
             per_concurso_probas[f"lightgbm_{n}"] = proba_lgbm_col
             per_concurso_probas[f"xgboost_{n}"] = proba_xgb_col
 
@@ -380,23 +375,17 @@ def train_and_evaluate(
             all_probabilities[n] = float(np.mean(proba_col))
             per_concurso_probas[n] = proba_col
 
-    # Ranking global médio
     if model_name == "ensemble_gbm":
         num_test = len(test_df)
-
-        # Construir score médio por concurso com ensemble de ranking
         final_mean_scores = {}
 
         for n in range(1, TOTAL_NUMBERS + 1):
             lgbm_col = per_concurso_probas[f"lightgbm_{n}"]
             xgb_col = per_concurso_probas[f"xgboost_{n}"]
-
-            # média simples como referência agregada
             final_mean_scores[n] = float(np.mean((lgbm_col + xgb_col) / 2.0))
 
         all_probabilities = final_mean_scores
 
-        # construir ranks por concurso
         for i in range(num_test):
             lgbm_scores = {n: float(per_concurso_probas[f"lightgbm_{n}"][i]) for n in range(1, TOTAL_NUMBERS + 1)}
             xgb_scores = {n: float(per_concurso_probas[f"xgboost_{n}"][i]) for n in range(1, TOTAL_NUMBERS + 1)}
@@ -452,14 +441,10 @@ def analyze_last_year(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, to
 
 
 def _build_candidate_games_from_pool(sorted_numbers: list[int]) -> list[list[int]]:
-    """
-    Gera 3 jogos mais concentrados.
-    """
     if len(sorted_numbers) < 7:
         return [sorted(sorted_numbers[:6])]
 
     r = sorted_numbers
-
     games = [
         sorted([r[0], r[1], r[2], r[3], r[4], r[5]]),
         sorted([r[0], r[1], r[2], r[3], r[4], r[6]]),
@@ -475,6 +460,24 @@ def _build_candidate_games_from_pool(sorted_numbers: list[int]) -> list[list[int
             seen.add(key)
 
     return unique_games
+
+
+def _weighted_sample_game(pool_numbers: list[int], pool_weights: list[float], rng: np.random.Generator) -> list[int]:
+    weights = np.array(pool_weights, dtype=float)
+    weights = weights / weights.sum()
+    chosen = rng.choice(pool_numbers, size=6, replace=False, p=weights)
+    return sorted(int(x) for x in chosen.tolist())
+
+
+def _score_game_internal(game: list[int], ranked_pool: list[int]) -> float:
+    rank_pos = {n: i + 1 for i, n in enumerate(ranked_pool)}
+    score = 0.0
+    for n in game:
+        pos = rank_pos.get(n, len(ranked_pool) + 5)
+        score += 1.0 / pos
+
+    score += len(set(game[:4]).intersection(set(ranked_pool[:4]))) * 0.15
+    return score
 
 
 def predict_multi_games(
@@ -501,9 +504,7 @@ def predict_multi_games(
 
         if model_name == "ensemble_gbm":
             final_rank_scores = per_concurso_ranks[i]
-            ranked_numbers = [
-                n for n, _ in sorted(final_rank_scores.items(), key=lambda x: x[1])
-            ]
+            ranked_numbers = [n for n, _ in sorted(final_rank_scores.items(), key=lambda x: x[1])]
         else:
             probas = {n: float(per_concurso_probas[n][i]) for n in range(1, TOTAL_NUMBERS + 1)}
             ranked_numbers = [n for n, _ in sorted(probas.items(), key=lambda x: x[1], reverse=True)]
@@ -552,6 +553,117 @@ def predict_multi_games(
             "best_hits": best_hits,
         })
 
+    return summarize_generated_games(concursos_data, all_generated_games, games_per_concurso=3, pool_size=pool_size, label="PADRÃO")
+
+
+def predict_multi_games_monte_carlo(
+    df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    results: dict,
+    pool_size: int = 10,
+    mc_samples: int = 400,
+    mc_keep_games: int = 3,
+    seed: int = 42,
+) -> dict:
+    per_concurso_probas = results["per_concurso_probas"]
+    per_concurso_ranks = results["per_concurso_ranks"]
+    model_name = results["model_name"]
+
+    test_concursos = test_df["concurso"].values
+    num_test = len(test_concursos)
+    rng = np.random.default_rng(seed)
+
+    concursos_data = []
+    all_generated_games = []
+
+    for i in range(num_test):
+        concurso = int(test_concursos[i])
+        original_row = df[df["concurso"] == concurso].iloc[0]
+        actual_numbers = sorted(original_row[DEZENA_COLS].astype(int).values.tolist())
+        data_jogo = original_row["data"]
+
+        if model_name == "ensemble_gbm":
+            final_rank_scores = per_concurso_ranks[i]
+            ranked_numbers = [n for n, _ in sorted(final_rank_scores.items(), key=lambda x: x[1])]
+        else:
+            probas = {n: float(per_concurso_probas[n][i]) for n in range(1, TOTAL_NUMBERS + 1)}
+            ranked_numbers = [n for n, _ in sorted(probas.items(), key=lambda x: x[1], reverse=True)]
+
+        top_pool = ranked_numbers[:pool_size]
+
+        # pesos maiores para ranks mais altos
+        base_weights = [float(pool_size - idx) for idx in range(pool_size)]
+        candidate_games = {}
+        for _ in range(mc_samples):
+            game = _weighted_sample_game(top_pool, base_weights, rng)
+            key = tuple(game)
+            score = _score_game_internal(game, top_pool)
+            if key not in candidate_games or score > candidate_games[key]:
+                candidate_games[key] = score
+
+        selected_games = [
+            list(k) for k, _ in sorted(candidate_games.items(), key=lambda x: x[1], reverse=True)[:mc_keep_games]
+        ]
+
+        game_results = []
+        best_hits = 0
+        best_game = None
+
+        for idx_game, predicted_numbers in enumerate(selected_games, start=1):
+            actual_set = set(actual_numbers)
+            predicted_set = set(predicted_numbers)
+            matched = sorted(actual_set & predicted_set)
+            hits = len(matched)
+            prize_score = PRIZE_SCORE.get(hits, 0)
+
+            row_game = {
+                "concurso": concurso,
+                "data": data_jogo,
+                "game_id": idx_game,
+                "predicted": sorted(predicted_numbers),
+                "actual": actual_numbers,
+                "matched": matched,
+                "hits": hits,
+                "prize_score": prize_score,
+                "top_pool": top_pool,
+            }
+            game_results.append(row_game)
+            all_generated_games.append(row_game)
+
+            if hits > best_hits:
+                best_hits = hits
+                best_game = row_game
+            elif hits == best_hits and best_game is not None and prize_score > best_game["prize_score"]:
+                best_game = row_game
+
+        concursos_data.append({
+            "concurso": concurso,
+            "data": data_jogo,
+            "actual": actual_numbers,
+            "top_pool": top_pool,
+            "games": game_results,
+            "best_game": best_game,
+            "best_hits": best_hits,
+        })
+
+    return summarize_generated_games(
+        concursos_data,
+        all_generated_games,
+        games_per_concurso=mc_keep_games,
+        pool_size=pool_size,
+        label="MONTE CARLO",
+        extra_info={"mc_samples": mc_samples}
+    )
+
+
+def summarize_generated_games(
+    concursos_data: list[dict],
+    all_generated_games: list[dict],
+    games_per_concurso: int,
+    pool_size: int,
+    label: str,
+    extra_info: dict | None = None,
+) -> dict:
     hits_all_games = [g["hits"] for g in all_generated_games]
     hits_distribution_all = Counter(hits_all_games)
 
@@ -569,12 +681,14 @@ def predict_multi_games(
     hit_rate_best = (total_best_hits / total_best_numbers) if total_best_numbers > 0 else 0.0
     best_prize_score_total = sum(g["prize_score"] for g in best_games)
 
-    return {
+    summary = {
+        "label": label,
         "concursos": concursos_data,
         "all_games": all_generated_games,
         "best_games": best_games,
         "total_concursos": len(concursos_data),
-        "games_per_concurso": 3,
+        "games_per_concurso": games_per_concurso,
+        "total_games_generated": len(all_generated_games),
         "pool_size": pool_size,
         "hit_rate_all_games": hit_rate_all_games,
         "hit_rate_best_games": hit_rate_best,
@@ -592,9 +706,14 @@ def predict_multi_games(
         "num_senas_best": sum(1 for g in best_games if g["hits"] == 6),
         "max_hits_all": max(hits_all_games) if hits_all_games else 0,
         "max_hits_best": max(best_hits_list) if best_hits_list else 0,
+        "min_hits_all": min(hits_all_games) if hits_all_games else 0,
+        "min_hits_best": min(best_hits_list) if best_hits_list else 0,
         "avg_hits_all_games": float(np.mean(hits_all_games)) if hits_all_games else 0.0,
         "avg_hits_best_games": float(np.mean(best_hits_list)) if best_hits_list else 0.0,
     }
+    if extra_info:
+        summary.update(extra_info)
+    return summary
 
 
 def print_model_metrics(results: dict) -> None:
@@ -646,55 +765,25 @@ def print_top10_analysis(analysis: dict) -> None:
     print(f"Overlap:      {sorted(analysis['overlap'])} ({analysis['overlap_count']}/10)")
 
 
-def print_multi_game_metrics(multi_pred: dict) -> None:
+def print_games_with_matches(summary: dict, top_n: int = 20) -> None:
+    matched_games = [g for g in summary["all_games"] if g["hits"] > 0]
+    matched_games = sorted(matched_games, key=lambda g: (g["hits"], g["prize_score"]), reverse=True)
+
     print("\n" + "=" * 90)
-    print("MÉTRICAS DE JOGOS FORTES")
+    print(f"JOGOS COM MATCH - {summary['label']}")
     print("=" * 90)
-    print(f"Concursos analisados:                 {multi_pred['total_concursos']}")
-    print(f"Jogos gerados por concurso:           {multi_pred['games_per_concurso']}")
-    print(f"Pool de dezenas por concurso:         top-{multi_pred['pool_size']}")
+    print(f"Concursos no teste:         {summary['total_concursos']}")
+    print(f"Jogos por concurso:         {summary['games_per_concurso']}")
+    print(f"Total de jogos gerados:     {summary['total_games_generated']}")
+    print(f"Top report mostrado:        {min(top_n, len(matched_games))}")
+    if "mc_samples" in summary:
+        print(f"Amostras Monte Carlo:       {summary['mc_samples']}")
 
-    print("\n--- Todos os jogos gerados ---")
-    print(f"Hit rate geral:                       {multi_pred['hit_rate_all_games']:.4f} ({multi_pred['hit_rate_all_games'] * 100:.2f}%)")
-    print(f"Média de acertos por jogo:            {multi_pred['avg_hits_all_games']:.4f}")
-    print(f"Ternos:                               {multi_pred['num_ternos_all']}")
-    print(f"Quadras:                              {multi_pred['num_quadras_all']}")
-    print(f"Quinas:                               {multi_pred['num_quinas_all']}")
-    print(f"Senas:                                {multi_pred['num_senas_all']}")
-    print(f"Maior acerto:                         {multi_pred['max_hits_all']}")
-    print(f"Prize score total:                    {multi_pred['prize_score_total']}")
+    if not matched_games:
+        print("Nenhum jogo com match foi encontrado.")
+        return
 
-    print("\nDistribuição de acertos (todos os jogos):")
-    for hits, count in multi_pred["hits_distribution_all_games"].items():
-        print(f"{hits} acertos: {count}")
-
-    print("\n--- Melhor jogo de cada concurso ---")
-    print(f"Hit rate melhor jogo:                 {multi_pred['hit_rate_best_games']:.4f} ({multi_pred['hit_rate_best_games'] * 100:.2f}%)")
-    print(f"Média de acertos do melhor jogo:      {multi_pred['avg_hits_best_games']:.4f}")
-    print(f"Ternos (melhor jogo):                 {multi_pred['num_ternos_best']}")
-    print(f"Quadras (melhor jogo):                {multi_pred['num_quadras_best']}")
-    print(f"Quinas (melhor jogo):                 {multi_pred['num_quinas_best']}")
-    print(f"Senas (melhor jogo):                  {multi_pred['num_senas_best']}")
-    print(f"Maior acerto (melhor jogo):           {multi_pred['max_hits_best']}")
-    print(f"Prize score total (melhor jogo):      {multi_pred['best_prize_score_total']}")
-
-    print("\nDistribuição de acertos (melhor jogo por concurso):")
-    for hits, count in multi_pred["hits_distribution_best_games"].items():
-        print(f"{hits} acertos: {count}")
-
-
-def print_best_games_report(multi_pred: dict, top_n: int = 20) -> None:
-    print("\n" + "=" * 90)
-    print(f"TOP {top_n} JOGOS GERADOS")
-    print("=" * 90)
-
-    best_overall = sorted(
-        multi_pred["all_games"],
-        key=lambda g: (g["hits"], g["prize_score"]),
-        reverse=True
-    )[:top_n]
-
-    for g in best_overall:
+    for g in matched_games[:top_n]:
         print(
             f"Concurso {g['concurso']} | Data {g['data']} | "
             f"Jogo #{g['game_id']} | "
@@ -706,26 +795,46 @@ def print_best_games_report(multi_pred: dict, top_n: int = 20) -> None:
         )
 
 
-def print_best_per_concurso_report(multi_pred: dict, top_n: int = 20) -> None:
+def print_summary_metrics(summary: dict) -> None:
     print("\n" + "=" * 90)
-    print(f"TOP {top_n} MELHORES CONCURSOS (PELO MELHOR JOGO)")
+    print(f"MÉTRICAS RESUMIDAS - {summary['label']}")
     print("=" * 90)
+    print(f"Concursos analisados:                 {summary['total_concursos']}")
+    print(f"Jogos por concurso:                   {summary['games_per_concurso']}")
+    print(f"Total de jogos gerados:               {summary['total_games_generated']}")
+    print(f"Pool de dezenas por concurso:         top-{summary['pool_size']}")
+    if "mc_samples" in summary:
+        print(f"Amostras Monte Carlo por concurso:    {summary['mc_samples']}")
 
-    best_concursos = sorted(
-        multi_pred["best_games"],
-        key=lambda g: (g["hits"], g["prize_score"]),
-        reverse=True
-    )[:top_n]
+    print("\n--- Todos os jogos gerados ---")
+    print(f"Hit rate geral:                       {summary['hit_rate_all_games']:.4f} ({summary['hit_rate_all_games'] * 100:.2f}%)")
+    print(f"Média de acertos por jogo:            {summary['avg_hits_all_games']:.4f}")
+    print(f"Maior acerto:                         {summary['max_hits_all']}")
+    print(f"Menor acerto:                         {summary['min_hits_all']}")
+    print(f"Ternos:                               {summary['num_ternos_all']}")
+    print(f"Quadras:                              {summary['num_quadras_all']}")
+    print(f"Quinas:                               {summary['num_quinas_all']}")
+    print(f"Senas:                                {summary['num_senas_all']}")
+    print(f"Prize score total:                    {summary['prize_score_total']}")
 
-    for g in best_concursos:
-        print(
-            f"Concurso {g['concurso']} | Data {g['data']} | "
-            f"Acertos {g['hits']}/6 | "
-            f"Prize {g['prize_score']} | "
-            f"Previsto {g['predicted']} | "
-            f"Real {g['actual']} | "
-            f"Match {g['matched']}"
-        )
+    print("\nDistribuição de acertos (todos os jogos):")
+    for hits, count in summary["hits_distribution_all_games"].items():
+        print(f"{hits} acertos: {count}")
+
+    print("\n--- Melhor jogo de cada concurso ---")
+    print(f"Hit rate melhor jogo:                 {summary['hit_rate_best_games']:.4f} ({summary['hit_rate_best_games'] * 100:.2f}%)")
+    print(f"Média de acertos do melhor jogo:      {summary['avg_hits_best_games']:.4f}")
+    print(f"Maior acerto (melhor jogo):           {summary['max_hits_best']}")
+    print(f"Menor acerto (melhor jogo):           {summary['min_hits_best']}")
+    print(f"Ternos (melhor jogo):                 {summary['num_ternos_best']}")
+    print(f"Quadras (melhor jogo):                {summary['num_quadras_best']}")
+    print(f"Quinas (melhor jogo):                 {summary['num_quinas_best']}")
+    print(f"Senas (melhor jogo):                  {summary['num_senas_best']}")
+    print(f"Prize score total (melhor jogo):      {summary['best_prize_score_total']}")
+
+    print("\nDistribuição de acertos (melhor jogo por concurso):")
+    for hits, count in summary["hits_distribution_best_games"].items():
+        print(f"{hits} acertos: {count}")
 
 
 def run_mega_sena_analysis(
@@ -735,6 +844,8 @@ def run_mega_sena_analysis(
     top_report: int = 20,
     rank_lgbm_weight: float = 0.5,
     rank_xgb_weight: float = 0.5,
+    mc_samples: int = 400,
+    mc_keep_games: int = 3,
 ) -> dict:
     print("=" * 90)
     print("1. CARREGANDO DADOS")
@@ -783,18 +894,39 @@ def run_mega_sena_analysis(
     print("5. ANÁLISE")
     print("=" * 90)
     analysis = analyze_last_year(df, test_df, results, top_n=10)
-    multi_pred = predict_multi_games(df, test_df, results, pool_size=pool_size)
+
+    standard_summary = predict_multi_games(
+        df=df,
+        test_df=test_df,
+        results=results,
+        pool_size=pool_size,
+    )
+
+    monte_carlo_summary = predict_multi_games_monte_carlo(
+        df=df,
+        test_df=test_df,
+        results=results,
+        pool_size=pool_size,
+        mc_samples=mc_samples,
+        mc_keep_games=mc_keep_games,
+    )
 
     print_model_metrics(results)
     print_top10_analysis(analysis)
-    print_multi_game_metrics(multi_pred)
-    print_best_games_report(multi_pred, top_n=top_report)
-    print_best_per_concurso_report(multi_pred, top_n=top_report)
+
+    # Primeiro os jogos com match
+    print_games_with_matches(standard_summary, top_n=top_report)
+    print_games_with_matches(monte_carlo_summary, top_n=top_report)
+
+    # Depois as métricas
+    print_summary_metrics(standard_summary)
+    print_summary_metrics(monte_carlo_summary)
 
     return {
         "results": results,
         "analysis": analysis,
-        "multi_pred": multi_pred,
+        "standard_summary": standard_summary,
+        "monte_carlo_summary": monte_carlo_summary,
         "train_size": len(train_df),
         "test_size": len(test_df),
     }
@@ -802,7 +934,7 @@ def run_mega_sena_analysis(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ML Mega Sena v6 - LightGBM / XGBoost / Ensemble GBM por ranking"
+        description="ML Mega Sena v6.1 - GBMs + jogos concentrados + Monte Carlo"
     )
     parser.add_argument(
         "--model",
@@ -827,7 +959,7 @@ def main():
         "--top-report",
         type=int,
         default=20,
-        help="Quantidade de jogos/concursos a imprimir no relatório final (default: 20)",
+        help="Quantidade de jogos com match a mostrar no relatório (default: 20)",
     )
     parser.add_argument(
         "--rank-lgbm-weight",
@@ -840,6 +972,18 @@ def main():
         type=float,
         default=0.5,
         help="Peso do ranking do XGBoost no ensemble_gbm (default: 0.5)",
+    )
+    parser.add_argument(
+        "--mc-samples",
+        type=int,
+        default=400,
+        help="Quantidade de amostras Monte Carlo por concurso (default: 400)",
+    )
+    parser.add_argument(
+        "--mc-keep-games",
+        type=int,
+        default=3,
+        help="Quantidade de jogos Monte Carlo mantidos por concurso (default: 3)",
     )
 
     args = parser.parse_args()
@@ -856,6 +1000,8 @@ def main():
         top_report=args.top_report,
         rank_lgbm_weight=args.rank_lgbm_weight / total_weight,
         rank_xgb_weight=args.rank_xgb_weight / total_weight,
+        mc_samples=args.mc_samples,
+        mc_keep_games=args.mc_keep_games,
     )
 
 
