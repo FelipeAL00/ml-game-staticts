@@ -1,11 +1,12 @@
 """
-app.py - v5
+app.py - v5.1
 Mega Sena ML focado em jogos fortes (terno / quadra / quina), usando:
 
 - estrutura original por concurso
 - 1 modelo por dezena
 - LightGBM agressivo
-- geração de múltiplos jogos por concurso a partir do top-12
+- geração de 3 jogos mais concentrados por concurso
+- pool-size configurável
 - métricas de premiação e acertos fortes via print()
 
 Objetivo:
@@ -34,7 +35,6 @@ CUTOFF_DATE = pd.Timestamp("2026-01-01")
 
 TOTAL_NUMBERS = 60
 NUMBERS_PER_DRAW = 6
-BASELINE_RANDOM_HIT_RATE = NUMBERS_PER_DRAW / TOTAL_NUMBERS  # 0.10
 
 DEZENA_COLS = [
     "dezena_1",
@@ -57,7 +57,6 @@ PRIZE_SCORE = {
 
 
 def load_mega_sena(filepath: Path) -> pd.DataFrame:
-    """Carrega os dados da Mega Sena."""
     df = pd.read_csv(filepath)
     df["data_parsed"] = pd.to_datetime(df["data"], format="%d/%m/%Y")
     df = df.sort_values("concurso").reset_index(drop=True)
@@ -65,10 +64,6 @@ def load_mega_sena(filepath: Path) -> pd.DataFrame:
 
 
 def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame:
-    """
-    Mantém a estrutura original:
-    1 linha por concurso, com features temporais e targets por dezena.
-    """
     all_draws = df[DEZENA_COLS].values.astype(int)
     features_list = []
 
@@ -82,10 +77,8 @@ def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame
         multi_window_features = {}
 
         for n in range(1, TOTAL_NUMBERS + 1):
-            # frequência base
             freq_features[f"freq_{n}"] = float(np.sum(recent_numbers == n) / len(recent_draws))
 
-            # atraso base
             last_seen = -1
             for j in range(len(recent_draws) - 1, -1, -1):
                 if n in recent_draws[j]:
@@ -95,7 +88,6 @@ def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame
                 (len(recent_draws) - last_seen) if last_seen >= 0 else (window + 1)
             )
 
-            # streak base
             streak = 0
             for j in range(len(recent_draws) - 1, -1, -1):
                 if n in recent_draws[j]:
@@ -104,7 +96,6 @@ def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame
                     break
             streak_features[f"streak_{n}"] = float(streak)
 
-            # multi-window
             for w in (5, 10, 20, 30, 60):
                 subset = all_draws[max(0, i - w):i]
                 if len(subset) == 0:
@@ -218,7 +209,6 @@ def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame
 
 
 def build_target(df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
-    """Cria target_1 ... target_60."""
     for n in range(1, TOTAL_NUMBERS + 1):
         targets = []
         for _, row in features_df.iterrows():
@@ -230,7 +220,6 @@ def build_target(df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def split_by_date(df_original: pd.DataFrame, features_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Divide treino e teste por data."""
     features_df = features_df.merge(
         df_original[["concurso", "data_parsed"]],
         on="concurso",
@@ -242,17 +231,12 @@ def split_by_date(df_original: pd.DataFrame, features_df: pd.DataFrame) -> tuple
 
 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
-    """Retorna colunas de features."""
     exclude = {"concurso", "idx", "data_parsed"}
     target_cols = {c for c in df.columns if c.startswith("target_")}
     return [c for c in df.columns if c not in exclude and c not in target_cols]
 
 
 def build_lightgbm_aggressive() -> LGBMClassifier:
-    """
-    LightGBM mais agressivo para buscar jogos fortes.
-    Menos conservador, mais foco em destacar positivos raros.
-    """
     return LGBMClassifier(
         objective="binary",
         n_estimators=700,
@@ -271,27 +255,19 @@ def build_lightgbm_aggressive() -> LGBMClassifier:
 
 
 def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """Calcula AUC quando possível."""
     if len(np.unique(y_true)) < 2:
         return float("nan")
     return float(roc_auc_score(y_true, y_score))
 
 
 def _safe_brier(y_true: np.ndarray, y_prob: np.ndarray) -> float:
-    """Calcula Brier quando possível."""
     try:
         return float(brier_score_loss(y_true, y_prob))
     except Exception:
         return float("nan")
 
 
-def train_and_evaluate(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-) -> dict:
-    """
-    Treina 1 LightGBM agressivo por dezena.
-    """
+def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
     feature_cols = get_feature_columns(train_df)
     X_train = train_df[feature_cols].values
     X_test = test_df[feature_cols].values
@@ -345,7 +321,6 @@ def train_and_evaluate(
 
 
 def analyze_last_year(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, top_n: int = 10) -> dict:
-    """Analisa top previstas vs top reais no período de teste."""
     ranking = results["ranking"]
     top_numbers = [n for n, _ in ranking[:top_n]]
 
@@ -354,9 +329,7 @@ def analyze_last_year(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, to
     all_drawn = test_original[DEZENA_COLS].values.astype(int).flatten()
     actual_freq = Counter(all_drawn)
 
-    hits = sum(actual_freq.get(n, 0) for n in top_numbers)
     most_common_actual = actual_freq.most_common(top_n)
-
     actual_top = {n for n, _ in most_common_actual}
     predicted_top = set(top_numbers)
     overlap = actual_top & predicted_top
@@ -366,57 +339,47 @@ def analyze_last_year(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, to
         "top_actual": most_common_actual,
         "overlap": overlap,
         "overlap_count": len(overlap),
-        "hits_in_test": hits,
-        "total_draws": len(test_concursos) * 6,
-        "test_concursos_count": len(test_concursos),
     }
 
 
-def _build_candidate_games_from_top12(sorted_numbers: list[int]) -> list[list[int]]:
+def _build_candidate_games_from_pool(sorted_numbers: list[int]) -> list[list[int]]:
     """
-    Gera 5 jogos a partir do top-12.
+    Gera 3 jogos mais concentrados.
     Estratégia:
-    - um jogo puro top-6
-    - 4 jogos com pequenas rotações para explorar quina/quadra
-    """
-    top12 = sorted_numbers[:12]
+    - Jogo 1: top-6 puro
+    - Jogo 2: top-5 + 7º
+    - Jogo 3: top-4 + 6º + 7º
 
-    if len(top12) < 12:
-        return [sorted(top12[:6])]
+    Essa abordagem concentra mais força no topo do ranking.
+    """
+    if len(sorted_numbers) < 7:
+        return [sorted(sorted_numbers[:6])]
+
+    r = sorted_numbers
 
     games = [
-        sorted(top12[0:6]),                          # jogo mais conservador
-        sorted(top12[0:5] + [top12[6]]),            # troca 6º pelo 7º
-        sorted(top12[0:4] + top12[5:7]),            # 4 fixos + 6º/7º
-        sorted(top12[0:4] + [top12[6], top12[7]]),  # 4 fixos + 7º/8º
-        sorted(top12[0:3] + [top12[4], top12[6], top12[8]]),  # mais diversificado
+        sorted([r[0], r[1], r[2], r[3], r[4], r[5]]),
+        sorted([r[0], r[1], r[2], r[3], r[4], r[6]]),
+        sorted([r[0], r[1], r[2], r[3], r[5], r[6]]),
     ]
 
-    # Remove duplicados se houver
-    unique = []
+    unique_games = []
     seen = set()
     for g in games:
-        key = tuple(sorted(g))
+        key = tuple(g)
         if key not in seen and len(g) == 6:
-            unique.append(sorted(g))
+            unique_games.append(g)
             seen.add(key)
 
-    return unique
+    return unique_games
 
 
 def predict_multi_games(
     df: pd.DataFrame,
     test_df: pd.DataFrame,
     results: dict,
-    pool_size: int = 12,
+    pool_size: int = 10,
 ) -> dict:
-    """
-    Para cada concurso:
-    - ranqueia dezenas por probabilidade
-    - pega top-12
-    - gera 5 jogos
-    - compara cada jogo com o resultado real
-    """
     per_concurso_probas = results["per_concurso_probas"]
     test_concursos = test_df["concurso"].values
     num_test = len(test_concursos)
@@ -435,7 +398,7 @@ def predict_multi_games(
         ranked_numbers = [n for n, _ in sorted_probas]
 
         top_pool = ranked_numbers[:pool_size]
-        games = _build_candidate_games_from_top12(top_pool)
+        games = _build_candidate_games_from_pool(top_pool)
 
         game_results = []
         best_hits = 0
@@ -478,7 +441,6 @@ def predict_multi_games(
             "best_hits": best_hits,
         })
 
-    # Métricas no nível de todos os jogos gerados
     hits_all_games = [g["hits"] for g in all_generated_games]
     hits_distribution_all = Counter(hits_all_games)
 
@@ -487,7 +449,6 @@ def predict_multi_games(
     hit_rate_all_games = (total_hits_all / total_numbers_all) if total_numbers_all > 0 else 0.0
     prize_score_total = sum(g["prize_score"] for g in all_generated_games)
 
-    # Métricas no nível do melhor jogo por concurso
     best_games = [c["best_game"] for c in concursos_data if c["best_game"] is not None]
     best_hits_list = [g["hits"] for g in best_games]
     best_hits_distribution = Counter(best_hits_list)
@@ -502,7 +463,7 @@ def predict_multi_games(
         "all_games": all_generated_games,
         "best_games": best_games,
         "total_concursos": len(concursos_data),
-        "games_per_concurso": 5,
+        "games_per_concurso": 3,
         "pool_size": pool_size,
         "hit_rate_all_games": hit_rate_all_games,
         "hit_rate_best_games": hit_rate_best,
@@ -526,7 +487,6 @@ def predict_multi_games(
 
 
 def print_model_metrics(results: dict) -> None:
-    """Imprime métricas agregadas dos 60 modelos."""
     rows = []
     for n, r in results["results_per_number"].items():
         rows.append({
@@ -552,9 +512,9 @@ def print_model_metrics(results: dict) -> None:
     print(f"AUC média:        {metrics_df['auc'].dropna().mean():.4f}")
     print(f"Brier médio:      {metrics_df['brier'].dropna().mean():.4f}")
 
-    print("\nTop 12 dezenas por probabilidade média:")
+    print("\nTop 10 dezenas por probabilidade média:")
     print("-" * 90)
-    for _, row in metrics_df.head(12).iterrows():
+    for _, row in metrics_df.head(10).iterrows():
         auc_str = f"{row['auc']:.4f}" if not pd.isna(row["auc"]) else "nan"
         print(
             f"Dezena {int(row['dezena']):02d} | "
@@ -567,7 +527,6 @@ def print_model_metrics(results: dict) -> None:
 
 
 def print_top10_analysis(analysis: dict) -> None:
-    """Imprime comparação top previsto vs real."""
     print("\n" + "=" * 90)
     print("TOP 10 DEZENAS MAIS PROVÁVEIS vs MAIS SORTEADAS")
     print("=" * 90)
@@ -577,7 +536,6 @@ def print_top10_analysis(analysis: dict) -> None:
 
 
 def print_multi_game_metrics(multi_pred: dict) -> None:
-    """Imprime métricas focadas em jogos fortes."""
     print("\n" + "=" * 90)
     print("MÉTRICAS DE JOGOS FORTES")
     print("=" * 90)
@@ -615,7 +573,6 @@ def print_multi_game_metrics(multi_pred: dict) -> None:
 
 
 def print_best_games_report(multi_pred: dict, top_n: int = 20) -> None:
-    """Imprime os melhores jogos gerados."""
     print("\n" + "=" * 90)
     print(f"TOP {top_n} JOGOS GERADOS")
     print("=" * 90)
@@ -639,7 +596,6 @@ def print_best_games_report(multi_pred: dict, top_n: int = 20) -> None:
 
 
 def print_best_per_concurso_report(multi_pred: dict, top_n: int = 20) -> None:
-    """Imprime o melhor jogo por concurso."""
     print("\n" + "=" * 90)
     print(f"TOP {top_n} MELHORES CONCURSOS (PELO MELHOR JOGO)")
     print("=" * 90)
@@ -663,10 +619,9 @@ def print_best_per_concurso_report(multi_pred: dict, top_n: int = 20) -> None:
 
 def run_mega_sena_analysis(
     window: int = 30,
-    pool_size: int = 12,
+    pool_size: int = 10,
     top_report: int = 20,
 ) -> dict:
-    """Executa pipeline completo."""
     print("=" * 90)
     print("1. CARREGANDO DADOS")
     print("=" * 90)
@@ -703,10 +658,7 @@ def run_mega_sena_analysis(
     print("\n" + "=" * 90)
     print("4. TREINAMENTO")
     print("=" * 90)
-    results = train_and_evaluate(
-        train_df=train_df,
-        test_df=test_df,
-    )
+    results = train_and_evaluate(train_df=train_df, test_df=test_df)
 
     print("\n" + "=" * 90)
     print("5. ANÁLISE")
@@ -731,7 +683,7 @@ def run_mega_sena_analysis(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ML Mega Sena v5 - LightGBM agressivo + múltiplos jogos por concurso"
+        description="ML Mega Sena v5.1 - LightGBM agressivo + 3 jogos concentrados por concurso"
     )
     parser.add_argument(
         "--window",
@@ -742,8 +694,8 @@ def main():
     parser.add_argument(
         "--pool-size",
         type=int,
-        default=12,
-        help="Tamanho do pool de dezenas fortes por concurso (default: 12)",
+        default=10,
+        help="Tamanho do pool de dezenas fortes por concurso (default: 10)",
     )
     parser.add_argument(
         "--top-report",
