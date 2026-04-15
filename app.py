@@ -1,11 +1,12 @@
 """
-app.py - v5.1
+app.py - v6
 Mega Sena ML focado em jogos fortes (terno / quadra / quina), usando:
 
 - estrutura original por concurso
 - 1 modelo por dezena
-- LightGBM agressivo
-- geração de 3 jogos mais concentrados por concurso
+- LightGBM, XGBoost ou ensemble_gbm
+- ensemble por ranking entre LightGBM + XGBoost
+- geração de 3 jogos concentrados por concurso
 - pool-size configurável
 - métricas de premiação e acertos fortes via print()
 
@@ -22,6 +23,7 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -254,6 +256,24 @@ def build_lightgbm_aggressive() -> LGBMClassifier:
     )
 
 
+def build_xgboost_aggressive() -> XGBClassifier:
+    return XGBClassifier(
+        n_estimators=500,
+        learning_rate=0.03,
+        max_depth=5,
+        min_child_weight=3,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        scale_pos_weight=9.0,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+
 def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     if len(np.unique(y_true)) < 2:
         return float("nan")
@@ -267,7 +287,18 @@ def _safe_brier(y_true: np.ndarray, y_prob: np.ndarray) -> float:
         return float("nan")
 
 
-def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
+def train_and_evaluate(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    model_name: str = "lightgbm",
+    rank_weights: tuple[float, float] = (0.5, 0.5),
+) -> dict:
+    """
+    Treina por dezena usando:
+    - lightgbm
+    - xgboost
+    - ensemble_gbm (ranking ensemble)
+    """
     feature_cols = get_feature_columns(train_df)
     X_train = train_df[feature_cols].values
     X_test = test_df[feature_cols].values
@@ -275,24 +306,61 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
     results_per_number = {}
     all_probabilities = {}
     per_concurso_probas = {}
+    per_concurso_ranks = {}
 
-    print("\nTreinando LightGBM agressivo por dezena...")
+    print(f"\nTreinando modelos por dezena: {model_name}")
 
     for n in range(1, TOTAL_NUMBERS + 1):
         target_col = f"target_{n}"
         y_train = train_df[target_col].values
         y_test = test_df[target_col].values
 
-        model = build_lightgbm_aggressive()
-        model.fit(X_train, y_train)
+        if model_name == "lightgbm":
+            model = build_lightgbm_aggressive()
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            y_proba = model.predict_proba(X_test)
+            proba_col = y_proba[:, 1] if y_proba.shape[1] > 1 else y_proba[:, 0]
+            pred_col = y_pred
+            model_store = model
 
-        y_pred = model.predict(X_test)
-        y_proba = model.predict_proba(X_test)
-        proba_col = y_proba[:, 1] if y_proba.shape[1] > 1 else y_proba[:, 0]
+        elif model_name == "xgboost":
+            model = build_xgboost_aggressive()
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            y_proba = model.predict_proba(X_test)
+            proba_col = y_proba[:, 1] if y_proba.shape[1] > 1 else y_proba[:, 0]
+            pred_col = y_pred
+            model_store = model
 
-        acc = float(accuracy_score(y_test, y_pred))
-        precision = float(precision_score(y_test, y_pred, zero_division=0))
-        recall = float(recall_score(y_test, y_pred, zero_division=0))
+        elif model_name == "ensemble_gbm":
+            model_lgbm = build_lightgbm_aggressive()
+            model_xgb = build_xgboost_aggressive()
+
+            model_lgbm.fit(X_train, y_train)
+            model_xgb.fit(X_train, y_train)
+
+            proba_lgbm = model_lgbm.predict_proba(X_test)
+            proba_xgb = model_xgb.predict_proba(X_test)
+
+            proba_lgbm_col = proba_lgbm[:, 1] if proba_lgbm.shape[1] > 1 else proba_lgbm[:, 0]
+            proba_xgb_col = proba_xgb[:, 1] if proba_xgb.shape[1] > 1 else proba_xgb[:, 0]
+
+            # Média de probabilidade apenas para métricas auxiliares
+            proba_col = (proba_lgbm_col + proba_xgb_col) / 2.0
+            pred_col = (proba_col >= 0.5).astype(int)
+            model_store = {"lightgbm": model_lgbm, "xgboost": model_xgb}
+
+            # Guardar probas individuais para ranking ensemble depois
+            per_concurso_probas[f"lightgbm_{n}"] = proba_lgbm_col
+            per_concurso_probas[f"xgboost_{n}"] = proba_xgb_col
+
+        else:
+            raise ValueError(f"Modelo inválido: {model_name}")
+
+        acc = float(accuracy_score(y_test, pred_col))
+        precision = float(precision_score(y_test, pred_col, zero_division=0))
+        recall = float(recall_score(y_test, pred_col, zero_division=0))
         auc = _safe_auc(y_test, proba_col)
         brier = _safe_brier(y_test, proba_col)
 
@@ -304,11 +372,49 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
             "brier": brier,
             "avg_probability": float(np.mean(proba_col)),
             "actual_frequency": float(np.mean(y_test)),
-            "predicted_frequency": float(np.mean(y_pred)),
-            "model": model,
+            "predicted_frequency": float(np.mean(pred_col)),
+            "model": model_store,
         }
-        all_probabilities[n] = float(np.mean(proba_col))
-        per_concurso_probas[n] = proba_col
+
+        if model_name != "ensemble_gbm":
+            all_probabilities[n] = float(np.mean(proba_col))
+            per_concurso_probas[n] = proba_col
+
+    # Ranking global médio
+    if model_name == "ensemble_gbm":
+        num_test = len(test_df)
+
+        # Construir score médio por concurso com ensemble de ranking
+        final_mean_scores = {}
+
+        for n in range(1, TOTAL_NUMBERS + 1):
+            lgbm_col = per_concurso_probas[f"lightgbm_{n}"]
+            xgb_col = per_concurso_probas[f"xgboost_{n}"]
+
+            # média simples como referência agregada
+            final_mean_scores[n] = float(np.mean((lgbm_col + xgb_col) / 2.0))
+
+        all_probabilities = final_mean_scores
+
+        # construir ranks por concurso
+        for i in range(num_test):
+            lgbm_scores = {n: float(per_concurso_probas[f"lightgbm_{n}"][i]) for n in range(1, TOTAL_NUMBERS + 1)}
+            xgb_scores = {n: float(per_concurso_probas[f"xgboost_{n}"][i]) for n in range(1, TOTAL_NUMBERS + 1)}
+
+            lgbm_sorted = sorted(lgbm_scores.items(), key=lambda x: x[1], reverse=True)
+            xgb_sorted = sorted(xgb_scores.items(), key=lambda x: x[1], reverse=True)
+
+            lgbm_rank = {n: rank + 1 for rank, (n, _) in enumerate(lgbm_sorted)}
+            xgb_rank = {n: rank + 1 for rank, (n, _) in enumerate(xgb_sorted)}
+
+            final_rank_scores = {}
+            for n in range(1, TOTAL_NUMBERS + 1):
+                final_rank_scores[n] = (
+                    rank_weights[0] * lgbm_rank[n] +
+                    rank_weights[1] * xgb_rank[n]
+                )
+
+            per_concurso_ranks[i] = final_rank_scores
 
     ranking = sorted(all_probabilities.items(), key=lambda x: x[1], reverse=True)
 
@@ -317,6 +423,9 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
         "ranking": ranking,
         "feature_columns": feature_cols,
         "per_concurso_probas": per_concurso_probas,
+        "per_concurso_ranks": per_concurso_ranks,
+        "model_name": model_name,
+        "rank_weights": rank_weights,
     }
 
 
@@ -345,12 +454,6 @@ def analyze_last_year(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, to
 def _build_candidate_games_from_pool(sorted_numbers: list[int]) -> list[list[int]]:
     """
     Gera 3 jogos mais concentrados.
-    Estratégia:
-    - Jogo 1: top-6 puro
-    - Jogo 2: top-5 + 7º
-    - Jogo 3: top-4 + 6º + 7º
-
-    Essa abordagem concentra mais força no topo do ranking.
     """
     if len(sorted_numbers) < 7:
         return [sorted(sorted_numbers[:6])]
@@ -381,6 +484,9 @@ def predict_multi_games(
     pool_size: int = 10,
 ) -> dict:
     per_concurso_probas = results["per_concurso_probas"]
+    per_concurso_ranks = results["per_concurso_ranks"]
+    model_name = results["model_name"]
+
     test_concursos = test_df["concurso"].values
     num_test = len(test_concursos)
 
@@ -393,9 +499,14 @@ def predict_multi_games(
         actual_numbers = sorted(original_row[DEZENA_COLS].astype(int).values.tolist())
         data_jogo = original_row["data"]
 
-        probas = {n: float(per_concurso_probas[n][i]) for n in range(1, TOTAL_NUMBERS + 1)}
-        sorted_probas = sorted(probas.items(), key=lambda x: x[1], reverse=True)
-        ranked_numbers = [n for n, _ in sorted_probas]
+        if model_name == "ensemble_gbm":
+            final_rank_scores = per_concurso_ranks[i]
+            ranked_numbers = [
+                n for n, _ in sorted(final_rank_scores.items(), key=lambda x: x[1])
+            ]
+        else:
+            probas = {n: float(per_concurso_probas[n][i]) for n in range(1, TOTAL_NUMBERS + 1)}
+            ranked_numbers = [n for n, _ in sorted(probas.items(), key=lambda x: x[1], reverse=True)]
 
         top_pool = ranked_numbers[:pool_size]
         games = _build_candidate_games_from_pool(top_pool)
@@ -618,9 +729,12 @@ def print_best_per_concurso_report(multi_pred: dict, top_n: int = 20) -> None:
 
 
 def run_mega_sena_analysis(
+    model_name: str = "ensemble_gbm",
     window: int = 30,
     pool_size: int = 10,
     top_report: int = 20,
+    rank_lgbm_weight: float = 0.5,
+    rank_xgb_weight: float = 0.5,
 ) -> dict:
     print("=" * 90)
     print("1. CARREGANDO DADOS")
@@ -658,7 +772,12 @@ def run_mega_sena_analysis(
     print("\n" + "=" * 90)
     print("4. TREINAMENTO")
     print("=" * 90)
-    results = train_and_evaluate(train_df=train_df, test_df=test_df)
+    results = train_and_evaluate(
+        train_df=train_df,
+        test_df=test_df,
+        model_name=model_name,
+        rank_weights=(rank_lgbm_weight, rank_xgb_weight),
+    )
 
     print("\n" + "=" * 90)
     print("5. ANÁLISE")
@@ -683,7 +802,14 @@ def run_mega_sena_analysis(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ML Mega Sena v5.1 - LightGBM agressivo + 3 jogos concentrados por concurso"
+        description="ML Mega Sena v6 - LightGBM / XGBoost / Ensemble GBM por ranking"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="ensemble_gbm",
+        choices=["lightgbm", "xgboost", "ensemble_gbm"],
+        help="Modelo a usar",
     )
     parser.add_argument(
         "--window",
@@ -703,13 +829,33 @@ def main():
         default=20,
         help="Quantidade de jogos/concursos a imprimir no relatório final (default: 20)",
     )
+    parser.add_argument(
+        "--rank-lgbm-weight",
+        type=float,
+        default=0.5,
+        help="Peso do ranking do LightGBM no ensemble_gbm (default: 0.5)",
+    )
+    parser.add_argument(
+        "--rank-xgb-weight",
+        type=float,
+        default=0.5,
+        help="Peso do ranking do XGBoost no ensemble_gbm (default: 0.5)",
+    )
 
     args = parser.parse_args()
 
+    total_weight = args.rank_lgbm_weight + args.rank_xgb_weight
+    if total_weight <= 0:
+        print("Erro: a soma dos pesos do ranking deve ser maior que zero.")
+        sys.exit(1)
+
     run_mega_sena_analysis(
+        model_name=args.model,
         window=args.window,
         pool_size=args.pool_size,
         top_report=args.top_report,
+        rank_lgbm_weight=args.rank_lgbm_weight / total_weight,
+        rank_xgb_weight=args.rank_xgb_weight / total_weight,
     )
 
 
