@@ -1,12 +1,16 @@
 """
-app.py - v6.3
+app.py - v6.4
 Mega Sena ML focado em jogos fortes, com:
 
-- XGBoost selective como preset principal
-- benchmark reduzido para os cenários mais promissores
-- correção da seleção do melhor cenário
-- Monte Carlo com diversidade mínima entre jogos
-- exibição do local de sorteio quando houver 4+ acertos
+- XGBoost selective
+- benchmark reduzido e focado
+- Monte Carlo reforçado
+- dois modos de geração Monte Carlo:
+    - core
+    - spread
+- deduplicação forte
+- diversidade mínima entre jogos finais
+- exibição do local de sorteio (coluna: local)
 """
 
 import argparse
@@ -59,7 +63,9 @@ def load_mega_sena(filepath: Path) -> pd.DataFrame:
 
 
 def get_draw_location(row: pd.Series) -> str:
-    return str(row["local"]) if pd.notna(row["local"]) else "Local não disponível"
+    if "local" in row.index and pd.notna(row["local"]):
+        return str(row["local"])
+    return "Local não disponível"
 
 
 def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame:
@@ -340,13 +346,23 @@ def _weighted_sample_game(pool_numbers: list[int], pool_weights: list[float], rn
     return sorted(int(x) for x in chosen.tolist())
 
 
-def _score_game_internal(game: list[int], ranked_pool: list[int]) -> float:
+def _score_game_internal(game: list[int], ranked_pool: list[int], mode: str = "core") -> float:
     rank_pos = {n: i + 1 for i, n in enumerate(ranked_pool)}
     score = 0.0
+
     for n in game:
         pos = rank_pos.get(n, len(ranked_pool) + 5)
         score += 1.0 / pos
-    score += len(set(game).intersection(set(ranked_pool[:4]))) * 0.15
+
+    if mode == "core":
+        score += len(set(game).intersection(set(ranked_pool[:4]))) * 0.18
+
+    elif mode == "spread":
+        top4 = len(set(game).intersection(set(ranked_pool[:4])))
+        mid = len(set(game).intersection(set(ranked_pool[4:7])))
+        tail = len(set(game).intersection(set(ranked_pool[7:10])))
+        score += top4 * 0.08 + mid * 0.10 + tail * 0.12
+
     return score
 
 
@@ -354,7 +370,7 @@ def _game_distance(g1: list[int], g2: list[int]) -> int:
     return len(set(g1) ^ set(g2))
 
 
-def _select_diverse_games(candidate_games: dict[tuple, float], keep_games: int, min_distance: int = 4) -> list[list[int]]:
+def _select_diverse_games(candidate_games: dict[tuple, float], keep_games: int, min_distance: int = 6) -> list[list[int]]:
     ordered = sorted(candidate_games.items(), key=lambda x: x[1], reverse=True)
     selected = []
 
@@ -379,7 +395,16 @@ def _select_diverse_games(candidate_games: dict[tuple, float], keep_games: int, 
                 if len(selected) == keep_games:
                     break
 
-    return [sorted(g) for g in selected[:keep_games]]
+    # dedupe final absoluto
+    final = []
+    seen = set()
+    for g in selected:
+        key = tuple(sorted(g))
+        if key not in seen:
+            final.append(sorted(g))
+            seen.add(key)
+
+    return final[:keep_games]
 
 
 def summarize_generated_games(
@@ -446,7 +471,7 @@ def predict_standard_games(
     df: pd.DataFrame,
     test_df: pd.DataFrame,
     results: dict,
-    pool_size: int = 8,
+    pool_size: int = 9,
 ) -> dict:
     per_concurso_probas = results["per_concurso_probas"]
     test_concursos = test_df["concurso"].values
@@ -521,9 +546,10 @@ def predict_monte_carlo_games(
     df: pd.DataFrame,
     test_df: pd.DataFrame,
     results: dict,
-    pool_size: int = 8,
-    mc_samples: int = 1000,
+    pool_size: int = 9,
+    mc_samples: int = 3000,
     mc_keep_games: int = 3,
+    mc_mode: str = "core",
     seed: int = 42,
 ) -> dict:
     per_concurso_probas = results["per_concurso_probas"]
@@ -551,11 +577,11 @@ def predict_monte_carlo_games(
         for _ in range(mc_samples):
             game = _weighted_sample_game(top_pool, weights, rng)
             key = tuple(game)
-            score = _score_game_internal(game, top_pool)
+            score = _score_game_internal(game, top_pool, mode=mc_mode)
             if key not in candidate_games or score > candidate_games[key]:
                 candidate_games[key] = score
 
-        selected_games = _select_diverse_games(candidate_games, keep_games=mc_keep_games, min_distance=4)
+        selected_games = _select_diverse_games(candidate_games, keep_games=mc_keep_games, min_distance=6)
 
         game_results = []
         best_game = None
@@ -602,8 +628,8 @@ def predict_monte_carlo_games(
         all_generated_games=all_generated_games,
         games_per_concurso=mc_keep_games,
         pool_size=pool_size,
-        label="MONTE CARLO",
-        extra_info={"mc_samples": mc_samples},
+        label=f"MONTE CARLO ({mc_mode.upper()})",
+        extra_info={"mc_samples": mc_samples, "mc_mode": mc_mode},
     )
 
 
@@ -620,6 +646,8 @@ def print_games_with_matches(summary: dict, top_n: int = 20) -> None:
     print(f"Top report mostrado:        {min(top_n, len(matched_games))}")
     if "mc_samples" in summary:
         print(f"Amostras Monte Carlo:       {summary['mc_samples']}")
+    if "mc_mode" in summary:
+        print(f"Modo Monte Carlo:           {summary['mc_mode']}")
 
     if not matched_games:
         print("Nenhum jogo com match foi encontrado.")
@@ -645,6 +673,8 @@ def print_summary_metrics(summary: dict) -> None:
     print(f"Pool de dezenas por concurso:         top-{summary['pool_size']}")
     if "mc_samples" in summary:
         print(f"Amostras Monte Carlo por concurso:    {summary['mc_samples']}")
+    if "mc_mode" in summary:
+        print(f"Modo Monte Carlo:                     {summary['mc_mode']}")
 
     print("\n--- Todos os jogos gerados ---")
     print(f"Hit rate geral:                       {summary['hit_rate_all_games']:.4f} ({summary['hit_rate_all_games'] * 100:.2f}%)")
@@ -677,7 +707,7 @@ def print_summary_metrics(summary: dict) -> None:
         print(f"{hits} acertos: {count}")
 
 
-def print_benchmark_table(benchmark_df: pd.DataFrame, top_n: int = 12) -> None:
+def print_benchmark_table(benchmark_df: pd.DataFrame, top_n: int = 10) -> None:
     print("\n" + "=" * 120)
     print("BENCHMARK AUTOMÁTICO DOS CENÁRIOS")
     print("=" * 120)
@@ -707,8 +737,9 @@ def run_single_scenario(
     pool_size: int,
     mc_samples: int,
     mc_keep_games: int,
+    mc_mode: str,
 ) -> dict:
-    print(f"\nExecutando cenário -> window={window} | pool={pool_size}")
+    print(f"\nExecutando cenário -> window={window} | pool={pool_size} | mc_mode={mc_mode}")
 
     features_df = build_frequency_features(df, window=window)
     features_df = build_target(df, features_df)
@@ -730,6 +761,7 @@ def run_single_scenario(
         pool_size=pool_size,
         mc_samples=mc_samples,
         mc_keep_games=mc_keep_games,
+        mc_mode=mc_mode,
     )
 
     return {
@@ -745,6 +777,7 @@ def run_benchmark(
     df: pd.DataFrame,
     windows: list[int],
     pools: list[int],
+    mc_modes: list[str],
     mc_samples: int,
     mc_keep_games: int,
 ) -> tuple[pd.DataFrame, dict]:
@@ -753,34 +786,36 @@ def run_benchmark(
 
     for window in windows:
         for pool_size in pools:
-            scenario_key = f"w={window}|p={pool_size}"
-            scenario_result = run_single_scenario(
-                df=df,
-                window=window,
-                pool_size=pool_size,
-                mc_samples=mc_samples,
-                mc_keep_games=mc_keep_games,
-            )
-            detailed_results[scenario_key] = scenario_result
+            for mc_mode in mc_modes:
+                scenario_key = f"w={window}|p={pool_size}|mc={mc_mode}"
+                scenario_result = run_single_scenario(
+                    df=df,
+                    window=window,
+                    pool_size=pool_size,
+                    mc_samples=mc_samples,
+                    mc_keep_games=mc_keep_games,
+                    mc_mode=mc_mode,
+                )
+                detailed_results[scenario_key] = scenario_result
 
-            for mode_name, summary in [
-                ("standard", scenario_result["standard_summary"]),
-                ("monte_carlo", scenario_result["monte_carlo_summary"]),
-            ]:
-                rows.append({
-                    "scenario_key": scenario_key,
-                    "window": window,
-                    "pool_size": pool_size,
-                    "mode": mode_name,
-                    "num_quadras_best": summary["num_quadras_best"],
-                    "num_quinas_best": summary["num_quinas_best"],
-                    "num_senas_best": summary["num_senas_best"],
-                    "max_hits_best": summary["max_hits_best"],
-                    "best_prize_score_total": summary["best_prize_score_total"],
-                    "avg_hits_best_games": summary["avg_hits_best_games"],
-                    "hit_rate_best_games": summary["hit_rate_best_games"],
-                    "num_ternos_best": summary["num_ternos_best"],
-                })
+                for mode_name, summary in [
+                    ("standard", scenario_result["standard_summary"]),
+                    (f"monte_carlo_{mc_mode}", scenario_result["monte_carlo_summary"]),
+                ]:
+                    rows.append({
+                        "scenario_key": scenario_key,
+                        "window": window,
+                        "pool_size": pool_size,
+                        "mode": mode_name,
+                        "num_quadras_best": summary["num_quadras_best"],
+                        "num_quinas_best": summary["num_quinas_best"],
+                        "num_senas_best": summary["num_senas_best"],
+                        "max_hits_best": summary["max_hits_best"],
+                        "best_prize_score_total": summary["best_prize_score_total"],
+                        "avg_hits_best_games": summary["avg_hits_best_games"],
+                        "hit_rate_best_games": summary["hit_rate_best_games"],
+                        "num_ternos_best": summary["num_ternos_best"],
+                    })
 
     benchmark_df = pd.DataFrame(rows)
     return benchmark_df, detailed_results
@@ -788,25 +823,31 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ML Mega Sena v6.3 - XGBoost selective + benchmark reduzido + local de sorteio"
+        description="ML Mega Sena v6.4 - XGBoost selective + MC core/spread"
     )
     parser.add_argument(
         "--windows",
         type=str,
-        default="15,30",
-        help='Lista de windows separadas por vírgula. Ex: "15,30"',
+        default="30",
+        help='Lista de windows separadas por vírgula. Ex: "30"',
     )
     parser.add_argument(
         "--pools",
         type=str,
-        default="8,9",
-        help='Lista de pool-sizes separadas por vírgula. Ex: "8,9"',
+        default="9,10",
+        help='Lista de pool-sizes separadas por vírgula. Ex: "9,10"',
+    )
+    parser.add_argument(
+        "--mc-modes",
+        type=str,
+        default="core,spread",
+        help='Lista de modos Monte Carlo. Ex: "core,spread"',
     )
     parser.add_argument(
         "--mc-samples",
         type=int,
-        default=1000,
-        help="Quantidade de amostras Monte Carlo por concurso (default: 1000)",
+        default=3000,
+        help="Quantidade de amostras Monte Carlo por concurso (default: 3000)",
     )
     parser.add_argument(
         "--mc-keep-games",
@@ -836,9 +877,10 @@ def main():
 
     windows = [int(x.strip()) for x in args.windows.split(",") if x.strip()]
     pools = [int(x.strip()) for x in args.pools.split(",") if x.strip()]
+    mc_modes = [x.strip() for x in args.mc_modes.split(",") if x.strip()]
 
     print("=" * 100)
-    print("MEGA SENA ML v6.3 - BENCHMARK REDUZIDO")
+    print("MEGA SENA ML v6.4 - REFINO DO MELHOR CAMINHO")
     print("=" * 100)
     print(f"Concursos carregados: {len(df)}")
     print(f"Período: {df['data'].iloc[0]} até {df['data'].iloc[-1]}")
@@ -846,11 +888,13 @@ def main():
     print(f"Pools testados:   {pools}")
     print(f"Preset:           selective")
     print(f"Monte Carlo:      {args.mc_samples} amostras / {args.mc_keep_games} jogos mantidos")
+    print(f"MC modes:         {mc_modes}")
 
     benchmark_df, detailed_results = run_benchmark(
         df=df,
         windows=windows,
         pools=pools,
+        mc_modes=mc_modes,
         mc_samples=args.mc_samples,
         mc_keep_games=args.mc_keep_games,
     )
@@ -871,7 +915,11 @@ def main():
         print(f"RELATÓRIO DETALHADO DO MELHOR CENÁRIO: {best_key} | mode={best_mode}")
         print("=" * 100)
 
-        summary = best_result["monte_carlo_summary"] if best_mode == "monte_carlo" else best_result["standard_summary"]
+        if best_mode == "standard":
+            summary = best_result["standard_summary"]
+        else:
+            summary = best_result["monte_carlo_summary"]
+
         print_games_with_matches(summary, top_n=args.top_report)
         print_summary_metrics(summary)
 
