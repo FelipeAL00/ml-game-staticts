@@ -1,14 +1,23 @@
 """
-app.py - v8
-Base vencedora: v6.5 Rotating Core
-Objetivo:
-- subir consistência média
-- manter / aumentar quadras
-- comparar contra acaso de forma robusta
-- escolher melhor estratégia entre rotating_core e rotating_balance
+app.py - v8.1
 
-Requisitos:
-pip install xgboost scikit-learn pandas numpy
+Base:
+- evolução da v8
+- mantém a melhor linha da v6.5/v8
+- adiciona baseline aleatório robusto com distribuição real
+
+Novidades:
+- baseline aleatório com:
+    * min / max / média / mediana
+    * distribuição de quadras / quinas / prize
+    * percentil do modelo vs acaso
+    * p-valor empírico simples
+- novo modo híbrido:
+    * hybrid_3x2 = 3 jogos rotating_core + 2 jogos rotating_balance
+- comparação completa entre:
+    * rotating_core
+    * rotating_balance
+    * hybrid_3x2
 """
 
 import argparse
@@ -54,7 +63,7 @@ PRIZE_SCORE = {
 
 
 # ======================================================================================
-# LOAD / PREP
+# LOAD
 # ======================================================================================
 
 def load_mega_sena(filepath: Path) -> pd.DataFrame:
@@ -71,7 +80,7 @@ def get_draw_location(row: pd.Series) -> str:
 
 
 # ======================================================================================
-# FEATURE ENGINEERING (base v6.5)
+# FEATURE ENGINEERING
 # ======================================================================================
 
 def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame:
@@ -342,10 +351,6 @@ def _dedupe_games(games: list[list[int]]) -> list[list[int]]:
 
 
 def build_rotating_core_games(ranked_pool: list[int]) -> list[list[int]]:
-    """
-    Estratégia vencedora da v6.5:
-    fixa top-4 e gira 2 dezenas entre ranks 5..10
-    """
     rp = ranked_pool[:10]
     if len(rp) < 8:
         return [sorted(rp[:6])]
@@ -373,15 +378,9 @@ def build_rotating_core_games(ranked_pool: list[int]) -> list[list[int]]:
 
 
 def build_rotating_balance_games(ranked_pool: list[int]) -> list[list[int]]:
-    """
-    Estratégia nova da v8:
-    menos concentrada para tentar subir consistência média.
-    Mistura top-3 fixo + rotações entre ranks 4..10.
-    """
     rp = ranked_pool[:10]
     if len(rp) < 10:
         rp = ranked_pool
-
     if len(rp) < 8:
         return [sorted(rp[:6])]
 
@@ -396,7 +395,6 @@ def build_rotating_balance_games(ranked_pool: list[int]) -> list[list[int]]:
         sorted(top3 + [r6, r8, r10]),
     ]
 
-    # reforço de diversidade mínima
     selected = []
     for g in _dedupe_games(candidates):
         if not selected:
@@ -415,62 +413,8 @@ def build_rotating_balance_games(ranked_pool: list[int]) -> list[list[int]]:
     return selected[:5]
 
 
-def _weighted_sample_game(pool_numbers: list[int], pool_weights: list[float], rng: np.random.Generator) -> list[int]:
-    weights = np.array(pool_weights, dtype=float)
-    weights = weights / weights.sum()
-    chosen = rng.choice(pool_numbers, size=6, replace=False, p=weights)
-    return sorted(int(x) for x in chosen.tolist())
-
-
-def _score_game_internal(game: list[int], ranked_pool: list[int], mode: str = "core") -> float:
-    rank_pos = {n: i + 1 for i, n in enumerate(ranked_pool)}
-    score = 0.0
-
-    for n in game:
-        pos = rank_pos.get(n, len(ranked_pool) + 5)
-        score += 1.0 / pos
-
-    if mode == "core":
-        score += len(set(game).intersection(set(ranked_pool[:4]))) * 0.20
-    elif mode == "spread":
-        top4 = len(set(game).intersection(set(ranked_pool[:4])))
-        mid = len(set(game).intersection(set(ranked_pool[4:7])))
-        tail = len(set(game).intersection(set(ranked_pool[7:10])))
-        score += top4 * 0.10 + mid * 0.12 + tail * 0.14
-
-    return score
-
-
-def _select_diverse_games(candidate_games: dict[tuple, float], keep_games: int, min_distance: int = 6) -> list[list[int]]:
-    ordered = sorted(candidate_games.items(), key=lambda x: x[1], reverse=True)
-    selected = []
-
-    for game_tuple, _ in ordered:
-        game = list(game_tuple)
-        if not selected:
-            selected.append(game)
-            if len(selected) == keep_games:
-                break
-            continue
-
-        if all(_game_distance(game, prev) >= min_distance for prev in selected):
-            selected.append(game)
-            if len(selected) == keep_games:
-                break
-
-    if len(selected) < keep_games:
-        for game_tuple, _ in ordered:
-            game = list(game_tuple)
-            if game not in selected:
-                selected.append(game)
-                if len(selected) == keep_games:
-                    break
-
-    return _dedupe_games(selected)[:keep_games]
-
-
 # ======================================================================================
-# EVALUATION
+# SUMMARY / EVAL
 # ======================================================================================
 
 def summarize_generated_games(
@@ -602,10 +546,6 @@ def _evaluate_games_for_concursos(
     )
 
 
-# ======================================================================================
-# PREDICTION MODES
-# ======================================================================================
-
 def _build_ranked_pool_for_concurso(results: dict, i: int, pool_size: int) -> list[int]:
     per_concurso_probas = results["per_concurso_probas"]
     probas = {n: float(per_concurso_probas[n][i]) for n in range(1, TOTAL_NUMBERS + 1)}
@@ -613,14 +553,8 @@ def _build_ranked_pool_for_concurso(results: dict, i: int, pool_size: int) -> li
     return ranked_numbers[:pool_size]
 
 
-def predict_rotating_core_games(
-    df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    results: dict,
-    pool_size: int = 10,
-) -> dict:
+def predict_rotating_core_games(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, pool_size: int = 10) -> dict:
     games_by_concurso = {}
-
     for i, concurso in enumerate(test_df["concurso"].values):
         top_pool = _build_ranked_pool_for_concurso(results, i, pool_size)
         games = build_rotating_core_games(top_pool)
@@ -643,14 +577,8 @@ def predict_rotating_core_games(
     )
 
 
-def predict_rotating_balance_games(
-    df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    results: dict,
-    pool_size: int = 10,
-) -> dict:
+def predict_rotating_balance_games(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, pool_size: int = 10) -> dict:
     games_by_concurso = {}
-
     for i, concurso in enumerate(test_df["concurso"].values):
         top_pool = _build_ranked_pool_for_concurso(results, i, pool_size)
         games = build_rotating_balance_games(top_pool)
@@ -673,12 +601,34 @@ def predict_rotating_balance_games(
     )
 
 
-def predict_random_games(
-    df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    games_per_concurso: int = 5,
-    seed: int = 42,
-) -> dict:
+def predict_hybrid_3x2_games(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, pool_size: int = 10) -> dict:
+    games_by_concurso = {}
+    for i, concurso in enumerate(test_df["concurso"].values):
+        top_pool = _build_ranked_pool_for_concurso(results, i, pool_size)
+
+        core_games = build_rotating_core_games(top_pool)[:3]
+        balance_games = build_rotating_balance_games(top_pool)[:2]
+        games = _dedupe_games(core_games + balance_games)
+
+        fallback = sorted(top_pool[:6])
+        while len(games) < 5:
+            if fallback not in games:
+                games.append(fallback)
+            else:
+                break
+
+        games_by_concurso[int(concurso)] = games[:5]
+
+    return _evaluate_games_for_concursos(
+        df=df,
+        test_df=test_df,
+        games_by_concurso=games_by_concurso,
+        label="HYBRID 3x2",
+        pool_size=pool_size,
+    )
+
+
+def predict_random_games(df: pd.DataFrame, test_df: pd.DataFrame, games_per_concurso: int = 5, seed: int = 42) -> dict:
     rng = np.random.default_rng(seed)
     games_by_concurso = {}
 
@@ -703,13 +653,17 @@ def predict_random_games(
     )
 
 
-def run_random_baseline_average(
+# ======================================================================================
+# RANDOM ROBUST METRICS
+# ======================================================================================
+
+def run_random_baseline_trials(
     df: pd.DataFrame,
     test_df: pd.DataFrame,
     games_per_concurso: int = 5,
     random_trials: int = 50,
     seed_base: int = 1000,
-) -> dict:
+) -> list[dict]:
     summaries = []
     for k in range(random_trials):
         summaries.append(
@@ -720,8 +674,16 @@ def run_random_baseline_average(
                 seed=seed_base + k,
             )
         )
+    return summaries
 
-    keys_mean = [
+
+def _distribution_counter(values: list[int | float]) -> dict:
+    c = Counter(values)
+    return dict(sorted(c.items(), key=lambda x: x[0]))
+
+
+def summarize_random_trials(random_summaries: list[dict]) -> dict:
+    keys = [
         "hit_rate_all_games",
         "hit_rate_best_games",
         "avg_hits_all_games",
@@ -738,17 +700,37 @@ def run_random_baseline_average(
         "max_hits_best",
     ]
 
-    avg = {}
-    for key in keys_mean:
-        avg[key] = float(np.mean([s[key] for s in summaries]))
+    out = {
+        "label": f"ALEATÓRIO ({len(random_summaries)} trials)",
+        "random_trials": len(random_summaries),
+    }
 
-    avg["label"] = f"ALEATÓRIO MÉDIO ({random_trials} trials)"
-    avg["total_concursos"] = summaries[0]["total_concursos"]
-    avg["games_per_concurso"] = summaries[0]["games_per_concurso"]
-    avg["total_games_generated"] = summaries[0]["total_games_generated"]
-    avg["pool_size"] = 60
-    avg["random_trials"] = random_trials
-    return avg
+    for key in keys:
+        vals = np.array([s[key] for s in random_summaries], dtype=float)
+        out[f"{key}_min"] = float(np.min(vals))
+        out[f"{key}_max"] = float(np.max(vals))
+        out[f"{key}_mean"] = float(np.mean(vals))
+        out[f"{key}_median"] = float(np.median(vals))
+
+    out["quadras_all_distribution"] = _distribution_counter([int(s["num_quadras_all"]) for s in random_summaries])
+    out["quadras_best_distribution"] = _distribution_counter([int(s["num_quadras_best"]) for s in random_summaries])
+    out["quinas_all_distribution"] = _distribution_counter([int(s["num_quinas_all"]) for s in random_summaries])
+    out["quinas_best_distribution"] = _distribution_counter([int(s["num_quinas_best"]) for s in random_summaries])
+    out["prize_total_distribution"] = _distribution_counter([int(s["prize_score_total"]) for s in random_summaries])
+    out["prize_best_distribution"] = _distribution_counter([int(s["best_prize_score_total"]) for s in random_summaries])
+
+    return out
+
+
+def empirical_p_value(random_summaries: list[dict], model_value: float, key: str) -> float:
+    vals = np.array([s[key] for s in random_summaries], dtype=float)
+    # p-valor unilateral: acaso >= modelo
+    return float((np.sum(vals >= model_value) + 1) / (len(vals) + 1))
+
+
+def percentile_vs_random(random_summaries: list[dict], model_value: float, key: str) -> float:
+    vals = np.array([s[key] for s in random_summaries], dtype=float)
+    return float(100.0 * np.mean(vals <= model_value))
 
 
 # ======================================================================================
@@ -813,9 +795,55 @@ def print_summary_metrics(summary: dict) -> None:
     print(f"Prize score total (melhor jogo):      {summary['best_prize_score_total']}")
 
 
-def print_vs_random(model_summary: dict, random_avg: dict) -> None:
+def print_random_distribution_summary(random_summary: dict) -> None:
     print("\n" + "=" * 100)
-    print("COMPARATIVO: MODELO VS ALEATÓRIO MÉDIO")
+    print("BASELINE ALEATÓRIO ROBUSTO")
+    print("=" * 100)
+    print(f"Trials aleatórios:                    {random_summary['random_trials']}")
+
+    print("\n--- Quadras ---")
+    print(f"Quadras total - min:                  {random_summary['num_quadras_all_min']:.0f}")
+    print(f"Quadras total - max:                  {random_summary['num_quadras_all_max']:.0f}")
+    print(f"Quadras total - média:                {random_summary['num_quadras_all_mean']:.4f}")
+    print(f"Quadras total - mediana:              {random_summary['num_quadras_all_median']:.4f}")
+    print(f"Distribuição quadras total:           {random_summary['quadras_all_distribution']}")
+
+    print(f"Quadras best - min:                   {random_summary['num_quadras_best_min']:.0f}")
+    print(f"Quadras best - max:                   {random_summary['num_quadras_best_max']:.0f}")
+    print(f"Quadras best - média:                 {random_summary['num_quadras_best_mean']:.4f}")
+    print(f"Quadras best - mediana:               {random_summary['num_quadras_best_median']:.4f}")
+    print(f"Distribuição quadras best:            {random_summary['quadras_best_distribution']}")
+
+    print("\n--- Quinas ---")
+    print(f"Quinas total - min:                   {random_summary['num_quinas_all_min']:.0f}")
+    print(f"Quinas total - max:                   {random_summary['num_quinas_all_max']:.0f}")
+    print(f"Quinas total - média:                 {random_summary['num_quinas_all_mean']:.4f}")
+    print(f"Quinas total - mediana:               {random_summary['num_quinas_all_median']:.4f}")
+    print(f"Distribuição quinas total:            {random_summary['quinas_all_distribution']}")
+
+    print(f"Quinas best - min:                    {random_summary['num_quinas_best_min']:.0f}")
+    print(f"Quinas best - max:                    {random_summary['num_quinas_best_max']:.0f}")
+    print(f"Quinas best - média:                  {random_summary['num_quinas_best_mean']:.4f}")
+    print(f"Quinas best - mediana:                {random_summary['num_quinas_best_median']:.4f}")
+    print(f"Distribuição quinas best:             {random_summary['quinas_best_distribution']}")
+
+    print("\n--- Prize ---")
+    print(f"Prize total - min:                    {random_summary['prize_score_total_min']:.0f}")
+    print(f"Prize total - max:                    {random_summary['prize_score_total_max']:.0f}")
+    print(f"Prize total - média:                  {random_summary['prize_score_total_mean']:.4f}")
+    print(f"Prize total - mediana:                {random_summary['prize_score_total_median']:.4f}")
+    print(f"Distribuição prize total:             {random_summary['prize_total_distribution']}")
+
+    print(f"Prize best - min:                     {random_summary['best_prize_score_total_min']:.0f}")
+    print(f"Prize best - max:                     {random_summary['best_prize_score_total_max']:.0f}")
+    print(f"Prize best - média:                   {random_summary['best_prize_score_total_mean']:.4f}")
+    print(f"Prize best - mediana:                 {random_summary['best_prize_score_total_median']:.4f}")
+    print(f"Distribuição prize best:              {random_summary['prize_best_distribution']}")
+
+
+def print_vs_random(model_summary: dict, random_avg: dict, random_trials: list[dict]) -> None:
+    print("\n" + "=" * 100)
+    print("COMPARATIVO: MODELO VS ALEATÓRIO ROBUSTO")
     print("=" * 100)
 
     def safe_div(a, b):
@@ -826,40 +854,51 @@ def print_vs_random(model_summary: dict, random_avg: dict) -> None:
 
     print("\n--- Todos os jogos ---")
     print(f"Hit rate modelo:                  {model_summary['hit_rate_all_games']:.4f}")
-    print(f"Hit rate aleatório médio:         {random_avg['hit_rate_all_games']:.4f}")
-    print(f"Lift hit rate vs acaso:           {safe_div(model_summary['hit_rate_all_games'], random_avg['hit_rate_all_games']):.4f}x")
+    print(f"Hit rate aleatório médio:         {random_avg['hit_rate_all_games_mean']:.4f}")
+    print(f"Lift hit rate vs acaso:           {safe_div(model_summary['hit_rate_all_games'], random_avg['hit_rate_all_games_mean']):.4f}x")
+    print(f"Percentil hit rate:               {percentile_vs_random(random_trials, model_summary['hit_rate_all_games'], 'hit_rate_all_games'):.2f}")
+    print(f"p-valor hit rate:                 {empirical_p_value(random_trials, model_summary['hit_rate_all_games'], 'hit_rate_all_games'):.4f}")
 
     print(f"Média acertos modelo:             {model_summary['avg_hits_all_games']:.4f}")
-    print(f"Média acertos aleatório:          {random_avg['avg_hits_all_games']:.4f}")
-    print(f"Lift média acertos:               {safe_div(model_summary['avg_hits_all_games'], random_avg['avg_hits_all_games']):.4f}x")
+    print(f"Média acertos aleatório:          {random_avg['avg_hits_all_games_mean']:.4f}")
+    print(f"Lift média acertos:               {safe_div(model_summary['avg_hits_all_games'], random_avg['avg_hits_all_games_mean']):.4f}x")
+    print(f"Percentil média acertos:          {percentile_vs_random(random_trials, model_summary['avg_hits_all_games'], 'avg_hits_all_games'):.2f}")
+    print(f"p-valor média acertos:            {empirical_p_value(random_trials, model_summary['avg_hits_all_games'], 'avg_hits_all_games'):.4f}")
 
     print(f"Prize score modelo:               {model_summary['prize_score_total']:.2f}")
-    print(f"Prize score aleatório médio:      {random_avg['prize_score_total']:.2f}")
-    print(f"Lift prize score vs acaso:        {safe_div(model_summary['prize_score_total'], random_avg['prize_score_total']):.4f}x")
+    print(f"Prize score aleatório médio:      {random_avg['prize_score_total_mean']:.4f}")
+    print(f"Lift prize score vs acaso:        {safe_div(model_summary['prize_score_total'], random_avg['prize_score_total_mean']):.4f}x")
+    print(f"Percentil prize total:            {percentile_vs_random(random_trials, model_summary['prize_score_total'], 'prize_score_total'):.2f}")
+    print(f"p-valor prize total:              {empirical_p_value(random_trials, model_summary['prize_score_total'], 'prize_score_total'):.4f}")
 
     print(f"Quadras modelo:                   {model_summary['num_quadras_all']}")
-    print(f"Quadras aleatório médio:          {random_avg['num_quadras_all']:.2f}")
+    print(f"Quadras aleatório min/max/média:  {random_avg['num_quadras_all_min']:.0f}/{random_avg['num_quadras_all_max']:.0f}/{random_avg['num_quadras_all_mean']:.4f}")
+    print(f"Percentil quadras total:          {percentile_vs_random(random_trials, model_summary['num_quadras_all'], 'num_quadras_all'):.2f}")
+    print(f"p-valor quadras total:            {empirical_p_value(random_trials, model_summary['num_quadras_all'], 'num_quadras_all'):.4f}")
+
     print(f"Quinas modelo:                    {model_summary['num_quinas_all']}")
-    print(f"Quinas aleatório médio:           {random_avg['num_quinas_all']:.2f}")
+    print(f"Quinas aleatório min/max/média:   {random_avg['num_quinas_all_min']:.0f}/{random_avg['num_quinas_all_max']:.0f}/{random_avg['num_quinas_all_mean']:.4f}")
+    print(f"Percentil quinas total:           {percentile_vs_random(random_trials, model_summary['num_quinas_all'], 'num_quinas_all'):.2f}")
+    print(f"p-valor quinas total:             {empirical_p_value(random_trials, model_summary['num_quinas_all'], 'num_quinas_all'):.4f}")
 
     print("\n--- Melhor jogo por concurso ---")
     print(f"Hit rate best modelo:             {model_summary['hit_rate_best_games']:.4f}")
-    print(f"Hit rate best aleatório médio:    {random_avg['hit_rate_best_games']:.4f}")
-    print(f"Lift best vs acaso:               {safe_div(model_summary['hit_rate_best_games'], random_avg['hit_rate_best_games']):.4f}x")
+    print(f"Hit rate best aleatório médio:    {random_avg['hit_rate_best_games_mean']:.4f}")
+    print(f"Lift best vs acaso:               {safe_div(model_summary['hit_rate_best_games'], random_avg['hit_rate_best_games_mean']):.4f}x")
+    print(f"Percentil best hit rate:          {percentile_vs_random(random_trials, model_summary['hit_rate_best_games'], 'hit_rate_best_games'):.2f}")
+    print(f"p-valor best hit rate:            {empirical_p_value(random_trials, model_summary['hit_rate_best_games'], 'hit_rate_best_games'):.4f}")
 
     print(f"Prize score best modelo:          {model_summary['best_prize_score_total']:.2f}")
-    print(f"Prize score best aleatório médio: {random_avg['best_prize_score_total']:.2f}")
-    print(f"Lift best prize vs acaso:         {safe_div(model_summary['best_prize_score_total'], random_avg['best_prize_score_total']):.4f}x")
+    print(f"Prize score best aleatório médio: {random_avg['best_prize_score_total_mean']:.4f}")
+    print(f"Lift best prize vs acaso:         {safe_div(model_summary['best_prize_score_total'], random_avg['best_prize_score_total_mean']):.4f}x")
+    print(f"Percentil best prize:             {percentile_vs_random(random_trials, model_summary['best_prize_score_total'], 'best_prize_score_total'):.2f}")
+    print(f"p-valor best prize:               {empirical_p_value(random_trials, model_summary['best_prize_score_total'], 'best_prize_score_total'):.4f}")
 
     print(f"Max hits best modelo:             {model_summary['max_hits_best']}")
-    print(f"Max hits best aleatório médio:    {random_avg['max_hits_best']:.2f}")
+    print(f"Max hits best aleatório média:    {random_avg['max_hits_best_mean']:.4f}")
 
 
 def composite_score(summary: dict) -> float:
-    """
-    Score composto da v8:
-    prioriza consistência, mas sem perder prêmio.
-    """
     score = 0.0
     score += summary["avg_hits_all_games"] * 20.0
     score += summary["hit_rate_all_games"] * 100.0
@@ -877,13 +916,13 @@ def composite_score(summary: dict) -> float:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ML Mega Sena v8 - evolução conservadora da v6.5"
+        description="ML Mega Sena v8.1 - baseline aleatório robusto + melhorias"
     )
     parser.add_argument("--window", type=int, default=30)
     parser.add_argument("--pool-size", type=int, default=10)
     parser.add_argument("--top-report", type=int, default=20)
-    parser.add_argument("--random-trials", type=int, default=50)
-    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--random-trials", type=int, default=100)
+    parser.add_argument("--random-seed-base", type=int, default=1000)
 
     args = parser.parse_args()
 
@@ -894,14 +933,14 @@ def main():
     df = load_mega_sena(DATA_PATH)
 
     print("=" * 100)
-    print("MEGA SENA ML v8 - BASE v6.5 + CONSISTÊNCIA + ACASO ROBUSTO")
+    print("MEGA SENA ML v8.1 - CONSISTÊNCIA + ACASO ROBUSTO + HYBRID")
     print("=" * 100)
     print(f"Concursos carregados: {len(df)}")
     print(f"Período: {df['data'].iloc[0]} até {df['data'].iloc[-1]}")
     print(f"Window:              {args.window}")
     print(f"Pool:                {args.pool_size}")
     print(f"Random trials:       {args.random_trials}")
-    print(f"Random seed:         {args.random_seed}")
+    print(f"Random seed base:    {args.random_seed_base}")
 
     features_df = build_frequency_features(df, window=args.window)
     features_df = build_target(df, features_df)
@@ -926,15 +965,23 @@ def main():
         pool_size=args.pool_size,
     )
 
-    random_avg = run_random_baseline_average(
+    hybrid_summary = predict_hybrid_3x2_games(
+        df=df,
+        test_df=test_df,
+        results=results,
+        pool_size=args.pool_size,
+    )
+
+    random_trials = run_random_baseline_trials(
         df=df,
         test_df=test_df,
         games_per_concurso=5,
         random_trials=args.random_trials,
-        seed_base=1000,
+        seed_base=args.random_seed_base,
     )
+    random_summary = summarize_random_trials(random_trials)
 
-    candidates = [rotating_core_summary, rotating_balance_summary]
+    candidates = [rotating_core_summary, rotating_balance_summary, hybrid_summary]
     best_model_summary = sorted(
         candidates,
         key=lambda s: (
@@ -951,15 +998,18 @@ def main():
 
     print_summary_metrics(rotating_core_summary)
     print_summary_metrics(rotating_balance_summary)
+    print_summary_metrics(hybrid_summary)
 
     print("\n" + "=" * 100)
-    print("COMPARATIVO INTERNO V8")
+    print("COMPARATIVO INTERNO v8.1")
     print("=" * 100)
     print(f"Composite score - ROTATING CORE:     {composite_score(rotating_core_summary):.4f}")
     print(f"Composite score - ROTATING BALANCE:  {composite_score(rotating_balance_summary):.4f}")
-    print(f"Melhor cenário v8:                   {best_model_summary['label']}")
+    print(f"Composite score - HYBRID 3x2:        {composite_score(hybrid_summary):.4f}")
+    print(f"Melhor cenário v8.1:                 {best_model_summary['label']}")
 
-    print_vs_random(best_model_summary, random_avg)
+    print_random_distribution_summary(random_summary)
+    print_vs_random(best_model_summary, random_summary, random_trials)
 
 
 if __name__ == "__main__":
