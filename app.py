@@ -1,19 +1,14 @@
 """
-app.py - v7
-Mega Sena ML com:
-
-- dataset longo
-- XGBRanker
-- ranking por concurso
-- walk-forward validation
-- comparação contra múltiplos aleatórios
-- geração de jogos por ranking
-- métricas de consistência + prêmio
-
+app.py - v8
+Base vencedora: v6.5 Rotating Core
 Objetivo:
-- melhorar acerto médio
-- manter/buscar quadras e quinas
-- medir se estamos acima do acaso de forma robusta
+- subir consistência média
+- manter / aumentar quadras
+- comparar contra acaso de forma robusta
+- escolher melhor estratégia entre rotating_core e rotating_balance
+
+Requisitos:
+pip install xgboost scikit-learn pandas numpy
 """
 
 import argparse
@@ -23,9 +18,18 @@ from collections import Counter
 
 import numpy as np
 import pandas as pd
-from xgboost import XGBRanker
+from xgboost import XGBClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    brier_score_loss,
+)
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "raw" / "mega_sena_2000_2026.csv"
+CUTOFF_DATE = pd.Timestamp("2026-01-01")
+
 TOTAL_NUMBERS = 60
 NUMBERS_PER_DRAW = 6
 
@@ -49,6 +53,10 @@ PRIZE_SCORE = {
 }
 
 
+# ======================================================================================
+# LOAD / PREP
+# ======================================================================================
+
 def load_mega_sena(filepath: Path) -> pd.DataFrame:
     df = pd.read_csv(filepath)
     df["data_parsed"] = pd.to_datetime(df["data"], format="%d/%m/%Y")
@@ -62,195 +70,356 @@ def get_draw_location(row: pd.Series) -> str:
     return "Local não disponível"
 
 
-def _get_recent_draws(all_draws: np.ndarray, i: int, window: int) -> np.ndarray:
-    start = max(0, i - window)
-    return all_draws[start:i]
+# ======================================================================================
+# FEATURE ENGINEERING (base v6.5)
+# ======================================================================================
 
-
-def _calc_number_features(recent_draws: np.ndarray, n: int, window: int) -> dict:
-    if len(recent_draws) == 0:
-        return {"freq": 0.0, "delay": float(window + 1), "streak": 0.0}
-
-    flat = recent_draws.flatten()
-    freq = float(np.sum(flat == n) / len(recent_draws))
-
-    last_seen = -1
-    for j in range(len(recent_draws) - 1, -1, -1):
-        if n in recent_draws[j]:
-            last_seen = j
-            break
-    delay = float((len(recent_draws) - last_seen) if last_seen >= 0 else (len(recent_draws) + 1))
-
-    streak = 0
-    for j in range(len(recent_draws) - 1, -1, -1):
-        if n in recent_draws[j]:
-            streak += 1
-        else:
-            break
-
-    return {"freq": freq, "delay": delay, "streak": float(streak)}
-
-
-def _build_context_features(last_draw: list[int], recent_draws: np.ndarray) -> dict:
-    soma_ultimo = int(np.sum(last_draw))
-    pares_ultimo = int(np.sum(np.array(last_draw) % 2 == 0))
-    impares_ultimo = 6 - pares_ultimo
-
-    somas = [int(np.sum(d)) for d in recent_draws] if len(recent_draws) > 0 else [0]
-    soma_media = float(np.mean(somas))
-    soma_std = float(np.std(somas))
-
-    consecutivas = sum(
-        1 for k in range(len(last_draw) - 1)
-        if last_draw[k + 1] - last_draw[k] == 1
-    )
-
-    q1 = sum(1 for n in last_draw if 1 <= n <= 15)
-    q2 = sum(1 for n in last_draw if 16 <= n <= 30)
-    q3 = sum(1 for n in last_draw if 31 <= n <= 45)
-    q4 = sum(1 for n in last_draw if 46 <= n <= 60)
-
-    gaps = [last_draw[k + 1] - last_draw[k] for k in range(len(last_draw) - 1)]
-
-    decadas = {}
-    for dec in range(6):
-        low = dec * 10 + 1
-        high = (dec + 1) * 10
-        decadas[f"decada_{low}_{high}"] = sum(1 for n in last_draw if low <= n <= high)
-
-    return {
-        "soma_ultimo": soma_ultimo,
-        "pares_ultimo": pares_ultimo,
-        "impares_ultimo": impares_ultimo,
-        "soma_media_janela": soma_media,
-        "soma_std_janela": soma_std,
-        "consecutivas": consecutivas,
-        "quadrante_1_15": q1,
-        "quadrante_16_30": q2,
-        "quadrante_31_45": q3,
-        "quadrante_46_60": q4,
-        "gap_medio": float(np.mean(gaps)) if gaps else 0.0,
-        "gap_max": float(max(gaps)) if gaps else 0.0,
-        "gap_min": float(min(gaps)) if gaps else 0.0,
-        "gap_std": float(np.std(gaps)) if len(gaps) > 1 else 0.0,
-        "amplitude": float(last_draw[-1] - last_draw[0]),
-        "mediana": float(np.median(last_draw)),
-        **decadas,
-    }
-
-
-def build_long_dataset(
-    df: pd.DataFrame,
-    min_window: int = 30,
-    windows: tuple[int, ...] = (5, 10, 20, 30, 60),
-) -> pd.DataFrame:
+def build_frequency_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame:
     all_draws = df[DEZENA_COLS].values.astype(int)
-    rows = []
+    features_list = []
 
-    for i in range(min_window, len(df)):
-        actual_draw = set(df.iloc[i][DEZENA_COLS].astype(int).tolist())
-        last_draw = sorted(all_draws[i - 1].tolist())
-        recent_base = _get_recent_draws(all_draws, i, min_window)
-        context = _build_context_features(last_draw, recent_base)
+    for i in range(window, len(df)):
+        recent_draws = all_draws[max(0, i - window):i]
+        recent_numbers = recent_draws.flatten()
 
-        number_rows = []
+        freq_features = {}
+        delay_features = {}
+        streak_features = {}
+        multi_window_features = {}
+
         for n in range(1, TOTAL_NUMBERS + 1):
-            row = {
-                "concurso": int(df.iloc[i]["concurso"]),
-                "data": df.iloc[i]["data"],
-                "data_parsed": df.iloc[i]["data_parsed"],
-                "idx": i,
-                "local": get_draw_location(df.iloc[i]),
-                "dezena": n,
-                "target": 1 if n in actual_draw else 0,
-                "is_even": 1 if n % 2 == 0 else 0,
-                "bucket_decade": int((n - 1) // 10) + 1,
-                "quadrant_num": (
-                    1 if 1 <= n <= 15 else
-                    2 if 16 <= n <= 30 else
-                    3 if 31 <= n <= 45 else
-                    4
-                ),
-            }
+            freq_features[f"freq_{n}"] = float(np.sum(recent_numbers == n) / len(recent_draws))
 
-            for w in windows:
-                recent_draws = _get_recent_draws(all_draws, i, w)
-                feats = _calc_number_features(recent_draws, n, w)
-                row[f"freq_w{w}"] = feats["freq"]
-                row[f"delay_w{w}"] = feats["delay"]
-                row[f"streak_w{w}"] = feats["streak"]
+            last_seen = -1
+            for j in range(len(recent_draws) - 1, -1, -1):
+                if n in recent_draws[j]:
+                    last_seen = j
+                    break
+            delay_features[f"atraso_{n}"] = float(
+                (len(recent_draws) - last_seen) if last_seen >= 0 else (window + 1)
+            )
 
-            row["trend_10_60"] = row.get("freq_w10", 0.0) - row.get("freq_w60", 0.0)
-            row["trend_5_30"] = row.get("freq_w5", 0.0) - row.get("freq_w30", 0.0)
+            streak = 0
+            for j in range(len(recent_draws) - 1, -1, -1):
+                if n in recent_draws[j]:
+                    streak += 1
+                else:
+                    break
+            streak_features[f"streak_{n}"] = float(streak)
 
-            row.update(context)
-            number_rows.append(row)
+            for w in (5, 10, 20, 30, 60):
+                subset = all_draws[max(0, i - w):i]
+                if len(subset) == 0:
+                    freq = 0.0
+                    delay = float(w + 1)
+                    streak_w = 0.0
+                else:
+                    flat = subset.flatten()
+                    freq = float(np.sum(flat == n) / len(subset))
 
-        tmp = pd.DataFrame(number_rows)
+                    last_seen = -1
+                    for j in range(len(subset) - 1, -1, -1):
+                        if n in subset[j]:
+                            last_seen = j
+                            break
+                    delay = float((len(subset) - last_seen) if last_seen >= 0 else (w + 1))
 
-        relative_cols = [
-            "freq_w10", "freq_w30", "freq_w60",
-            "delay_w10", "delay_w30", "delay_w60",
-            "streak_w10", "streak_w30",
-            "trend_10_60", "trend_5_30",
-        ]
+                    streak_local = 0
+                    for j in range(len(subset) - 1, -1, -1):
+                        if n in subset[j]:
+                            streak_local += 1
+                        else:
+                            break
+                    streak_w = float(streak_local)
 
-        for col in relative_cols:
-            tmp[f"rank_desc_{col}"] = tmp[col].rank(method="average", ascending=False)
-            tmp[f"rank_asc_{col}"] = tmp[col].rank(method="average", ascending=True)
-            tmp[f"pct_{col}"] = tmp[col].rank(method="average", pct=True)
+                multi_window_features[f"freq_w{w}_{n}"] = freq
+                multi_window_features[f"delay_w{w}_{n}"] = delay
+                multi_window_features[f"streak_w{w}_{n}"] = streak_w
 
-            std = tmp[col].std()
-            mean = tmp[col].mean()
-            if std == 0 or pd.isna(std):
-                tmp[f"z_{col}"] = 0.0
-            else:
-                tmp[f"z_{col}"] = (tmp[col] - mean) / std
+            multi_window_features[f"trend_10_60_{n}"] = (
+                multi_window_features[f"freq_w10_{n}"] - multi_window_features[f"freq_w60_{n}"]
+            )
+            multi_window_features[f"trend_5_30_{n}"] = (
+                multi_window_features[f"freq_w5_{n}"] - multi_window_features[f"freq_w30_{n}"]
+            )
 
-        rows.append(tmp)
+        last_draw = sorted(all_draws[i - 1].tolist())
 
-    return pd.concat(rows, ignore_index=True)
+        soma_ultimo = int(np.sum(last_draw))
+        pares_ultimo = int(np.sum(np.array(last_draw) % 2 == 0))
+        impares_ultimo = 6 - pares_ultimo
+
+        somas = [int(np.sum(d)) for d in recent_draws]
+        soma_media = float(np.mean(somas))
+        soma_std = float(np.std(somas))
+
+        consecutivas = sum(
+            1 for k in range(len(last_draw) - 1)
+            if last_draw[k + 1] - last_draw[k] == 1
+        )
+
+        q1 = sum(1 for n in last_draw if 1 <= n <= 15)
+        q2 = sum(1 for n in last_draw if 16 <= n <= 30)
+        q3 = sum(1 for n in last_draw if 31 <= n <= 45)
+        q4 = sum(1 for n in last_draw if 46 <= n <= 60)
+
+        gaps = [last_draw[k + 1] - last_draw[k] for k in range(len(last_draw) - 1)]
+        gap_medio = float(np.mean(gaps)) if gaps else 0.0
+        gap_max = float(max(gaps)) if gaps else 0.0
+        gap_min = float(min(gaps)) if gaps else 0.0
+        gap_std = float(np.std(gaps)) if len(gaps) > 1 else 0.0
+
+        decadas = {}
+        for dec in range(6):
+            low = dec * 10 + 1
+            high = (dec + 1) * 10
+            decadas[f"decada_{low}_{high}"] = sum(1 for n in last_draw if low <= n <= high)
+
+        hot_count = sum(
+            1 for n in range(1, TOTAL_NUMBERS + 1)
+            if freq_features[f"freq_{n}"] > 0.12
+        )
+        cold_count = sum(
+            1 for n in range(1, TOTAL_NUMBERS + 1)
+            if freq_features[f"freq_{n}"] < 0.08
+        )
+
+        amplitude = float(last_draw[-1] - last_draw[0])
+        mediana = float(np.median(last_draw))
+
+        row = {
+            "concurso": int(df.iloc[i]["concurso"]),
+            "idx": i,
+            **freq_features,
+            **delay_features,
+            **streak_features,
+            **multi_window_features,
+            **decadas,
+            "soma_ultimo": soma_ultimo,
+            "pares_ultimo": pares_ultimo,
+            "impares_ultimo": impares_ultimo,
+            "soma_media_janela": soma_media,
+            "soma_std_janela": soma_std,
+            "consecutivas": consecutivas,
+            "quadrante_1_15": q1,
+            "quadrante_16_30": q2,
+            "quadrante_31_45": q3,
+            "quadrante_46_60": q4,
+            "gap_medio": gap_medio,
+            "gap_max": gap_max,
+            "gap_min": gap_min,
+            "gap_std": gap_std,
+            "hot_count": hot_count,
+            "cold_count": cold_count,
+            "amplitude": amplitude,
+            "mediana": mediana,
+        }
+        features_list.append(row)
+
+    return pd.DataFrame(features_list)
 
 
-def build_ranker() -> XGBRanker:
-    return XGBRanker(
-        objective="rank:pairwise",
-        n_estimators=500,
-        learning_rate=0.03,
-        max_depth=5,
-        min_child_weight=3,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
+def build_target(df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
+    for n in range(1, TOTAL_NUMBERS + 1):
+        targets = []
+        for _, row in features_df.iterrows():
+            idx = int(row["idx"])
+            drawn = df.iloc[idx][DEZENA_COLS].astype(int).values
+            targets.append(1 if n in drawn else 0)
+        features_df[f"target_{n}"] = targets
+    return features_df
+
+
+def split_by_date(df_original: pd.DataFrame, features_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    features_df = features_df.merge(
+        df_original[["concurso", "data_parsed"]],
+        on="concurso",
+        how="left",
+    )
+    train = features_df[features_df["data_parsed"] < CUTOFF_DATE].copy()
+    test = features_df[features_df["data_parsed"] >= CUTOFF_DATE].copy()
+    return train, test
+
+
+def get_feature_columns(df: pd.DataFrame) -> list[str]:
+    exclude = {"concurso", "idx", "data_parsed"}
+    target_cols = {c for c in df.columns if c.startswith("target_")}
+    return [c for c in df.columns if c not in exclude and c not in target_cols]
+
+
+# ======================================================================================
+# MODEL
+# ======================================================================================
+
+def build_xgboost_model() -> XGBClassifier:
+    return XGBClassifier(
+        n_estimators=600,
+        learning_rate=0.025,
+        max_depth=4,
+        min_child_weight=4,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        reg_alpha=0.15,
+        reg_lambda=1.5,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        scale_pos_weight=10.0,
         random_state=42,
         n_jobs=-1,
     )
 
 
-def get_feature_columns(long_df: pd.DataFrame) -> list[str]:
-    exclude = {
-        "concurso", "data", "data_parsed", "idx", "local",
-        "target"
-    }
-    return [c for c in long_df.columns if c not in exclude]
+def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
+    return float(roc_auc_score(y_true, y_score))
 
 
-def fit_ranker(train_df: pd.DataFrame, feature_cols: list[str]) -> XGBRanker:
+def _safe_brier(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    try:
+        return float(brier_score_loss(y_true, y_prob))
+    except Exception:
+        return float("nan")
+
+
+def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
+    feature_cols = get_feature_columns(train_df)
     X_train = train_df[feature_cols].values
-    y_train = train_df["target"].values
-    group_train = train_df.groupby("concurso").size().to_list()
+    X_test = test_df[feature_cols].values
 
-    model = build_ranker()
-    model.fit(X_train, y_train, group=group_train)
-    return model
+    results_per_number = {}
+    per_concurso_probas = {}
+
+    for n in range(1, TOTAL_NUMBERS + 1):
+        target_col = f"target_{n}"
+        y_train = train_df[target_col].values
+        y_test = test_df[target_col].values
+
+        model = build_xgboost_model()
+        model.fit(X_train, y_train)
+
+        y_pred = model.predict(X_test)
+        y_proba = model.predict_proba(X_test)
+        proba_col = y_proba[:, 1] if y_proba.shape[1] > 1 else y_proba[:, 0]
+
+        results_per_number[n] = {
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "precision": float(precision_score(y_test, y_pred, zero_division=0)),
+            "recall": float(recall_score(y_test, y_pred, zero_division=0)),
+            "auc": _safe_auc(y_test, proba_col),
+            "brier": _safe_brier(y_test, proba_col),
+            "avg_probability": float(np.mean(proba_col)),
+            "actual_frequency": float(np.mean(y_test)),
+            "predicted_frequency": float(np.mean(y_pred)),
+            "model": model,
+        }
+        per_concurso_probas[n] = proba_col
+
+    return {
+        "results_per_number": results_per_number,
+        "feature_columns": feature_cols,
+        "per_concurso_probas": per_concurso_probas,
+    }
 
 
-def score_concursos(model: XGBRanker, df_part: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
-    out = df_part.copy()
-    X = out[feature_cols].values
-    out["score"] = model.predict(X)
+# ======================================================================================
+# GAME BUILDING
+# ======================================================================================
+
+def _game_distance(g1: list[int], g2: list[int]) -> int:
+    return len(set(g1) ^ set(g2))
+
+
+def _dedupe_games(games: list[list[int]]) -> list[list[int]]:
+    out = []
+    seen = set()
+    for g in games:
+        key = tuple(sorted(g))
+        if key not in seen:
+            seen.add(key)
+            out.append(sorted(g))
     return out
+
+
+def build_rotating_core_games(ranked_pool: list[int]) -> list[list[int]]:
+    """
+    Estratégia vencedora da v6.5:
+    fixa top-4 e gira 2 dezenas entre ranks 5..10
+    """
+    rp = ranked_pool[:10]
+    if len(rp) < 8:
+        return [sorted(rp[:6])]
+
+    core = rp[:4]
+    tail = rp[4:]
+
+    pairs = [
+        (tail[0], tail[1]),
+        (tail[0], tail[2]) if len(tail) > 2 else None,
+        (tail[1], tail[2]) if len(tail) > 2 else None,
+        (tail[0], tail[3]) if len(tail) > 3 else None,
+        (tail[1], tail[3]) if len(tail) > 3 else None,
+    ]
+
+    games = []
+    for pair in pairs:
+        if pair is None:
+            continue
+        game = sorted(core + [pair[0], pair[1]])
+        if len(set(game)) == 6:
+            games.append(game)
+
+    return _dedupe_games(games)[:5]
+
+
+def build_rotating_balance_games(ranked_pool: list[int]) -> list[list[int]]:
+    """
+    Estratégia nova da v8:
+    menos concentrada para tentar subir consistência média.
+    Mistura top-3 fixo + rotações entre ranks 4..10.
+    """
+    rp = ranked_pool[:10]
+    if len(rp) < 10:
+        rp = ranked_pool
+
+    if len(rp) < 8:
+        return [sorted(rp[:6])]
+
+    top3 = rp[:3]
+    r4, r5, r6, r7, r8, r9, r10 = rp[3:10]
+
+    candidates = [
+        sorted(top3 + [r4, r5, r6]),
+        sorted(top3 + [r4, r5, r7]),
+        sorted(top3 + [r4, r6, r8]),
+        sorted(top3 + [r5, r7, r9]),
+        sorted(top3 + [r6, r8, r10]),
+    ]
+
+    # reforço de diversidade mínima
+    selected = []
+    for g in _dedupe_games(candidates):
+        if not selected:
+            selected.append(g)
+        else:
+            if all(_game_distance(g, prev) >= 4 for prev in selected):
+                selected.append(g)
+
+    if len(selected) < 5:
+        for g in _dedupe_games(candidates):
+            if g not in selected:
+                selected.append(g)
+            if len(selected) == 5:
+                break
+
+    return selected[:5]
+
+
+def _weighted_sample_game(pool_numbers: list[int], pool_weights: list[float], rng: np.random.Generator) -> list[int]:
+    weights = np.array(pool_weights, dtype=float)
+    weights = weights / weights.sum()
+    chosen = rng.choice(pool_numbers, size=6, replace=False, p=weights)
+    return sorted(int(x) for x in chosen.tolist())
 
 
 def _score_game_internal(game: list[int], ranked_pool: list[int], mode: str = "core") -> float:
@@ -270,17 +439,6 @@ def _score_game_internal(game: list[int], ranked_pool: list[int], mode: str = "c
         score += top4 * 0.10 + mid * 0.12 + tail * 0.14
 
     return score
-
-
-def _weighted_sample_game(pool_numbers: list[int], pool_weights: list[float], rng: np.random.Generator) -> list[int]:
-    weights = np.array(pool_weights, dtype=float)
-    weights = weights / weights.sum()
-    chosen = rng.choice(pool_numbers, size=6, replace=False, p=weights)
-    return sorted(int(x) for x in chosen.tolist())
-
-
-def _game_distance(g1: list[int], g2: list[int]) -> int:
-    return len(set(g1) ^ set(g2))
 
 
 def _select_diverse_games(candidate_games: dict[tuple, float], keep_games: int, min_distance: int = 6) -> list[list[int]]:
@@ -308,54 +466,12 @@ def _select_diverse_games(candidate_games: dict[tuple, float], keep_games: int, 
                 if len(selected) == keep_games:
                     break
 
-    final = []
-    seen = set()
-    for g in selected:
-        key = tuple(sorted(g))
-        if key not in seen:
-            final.append(sorted(g))
-            seen.add(key)
-
-    return final[:keep_games]
+    return _dedupe_games(selected)[:keep_games]
 
 
-def _build_rotating_core_games(ranked_pool: list[int]) -> list[list[int]]:
-    rp = ranked_pool[:10]
-    if len(rp) < 10:
-        rp = ranked_pool
-
-    if len(rp) < 8:
-        return [sorted(rp[:6])]
-
-    core = rp[:4]
-    tail = rp[4:]
-
-    candidates = []
-    pairs = [
-        (tail[0], tail[1]),
-        (tail[0], tail[2]) if len(tail) > 2 else None,
-        (tail[1], tail[2]) if len(tail) > 2 else None,
-        (tail[0], tail[3]) if len(tail) > 3 else None,
-        (tail[1], tail[3]) if len(tail) > 3 else None,
-    ]
-
-    for pair in pairs:
-        if pair is None:
-            continue
-        game = sorted(core + [pair[0], pair[1]])
-        if len(set(game)) == 6:
-            candidates.append(game)
-
-    unique = []
-    seen = set()
-    for g in candidates:
-        key = tuple(g)
-        if key not in seen:
-            unique.append(g)
-            seen.add(key)
-
-    return unique[:5]
-
+# ======================================================================================
+# EVALUATION
+# ======================================================================================
 
 def summarize_generated_games(
     concursos_data: list[dict],
@@ -417,16 +533,24 @@ def summarize_generated_games(
     return summary
 
 
-def _evaluate_games_for_concursos(scored_test_df: pd.DataFrame, games_by_concurso: dict, label: str, pool_size: int, extra_info: dict | None = None) -> dict:
+def _evaluate_games_for_concursos(
+    df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    games_by_concurso: dict,
+    label: str,
+    pool_size: int,
+    extra_info: dict | None = None,
+) -> dict:
+    test_concursos = test_df["concurso"].values
     concursos_data = []
     all_generated_games = []
 
-    for concurso, concurso_df in scored_test_df.groupby("concurso"):
+    for concurso in test_concursos:
         concurso = int(concurso)
-        row0 = concurso_df.iloc[0]
-        actual_numbers = sorted(concurso_df.loc[concurso_df["target"] == 1, "dezena"].astype(int).tolist())
-        data_jogo = row0["data"]
-        local_jogo = row0["local"]
+        original_row = df[df["concurso"] == concurso].iloc[0]
+        actual_numbers = sorted(original_row[DEZENA_COLS].astype(int).values.tolist())
+        data_jogo = original_row["data"]
+        local_jogo = get_draw_location(original_row)
 
         games = games_by_concurso[concurso]
 
@@ -478,66 +602,87 @@ def _evaluate_games_for_concursos(scored_test_df: pd.DataFrame, games_by_concurs
     )
 
 
-def predict_rotating_core_games(scored_test_df: pd.DataFrame, pool_size: int = 10) -> dict:
+# ======================================================================================
+# PREDICTION MODES
+# ======================================================================================
+
+def _build_ranked_pool_for_concurso(results: dict, i: int, pool_size: int) -> list[int]:
+    per_concurso_probas = results["per_concurso_probas"]
+    probas = {n: float(per_concurso_probas[n][i]) for n in range(1, TOTAL_NUMBERS + 1)}
+    ranked_numbers = [n for n, _ in sorted(probas.items(), key=lambda x: x[1], reverse=True)]
+    return ranked_numbers[:pool_size]
+
+
+def predict_rotating_core_games(
+    df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    results: dict,
+    pool_size: int = 10,
+) -> dict:
     games_by_concurso = {}
 
-    for concurso, concurso_df in scored_test_df.groupby("concurso"):
-        ranked_numbers = concurso_df.sort_values("score", ascending=False)["dezena"].astype(int).tolist()
-        top_pool = ranked_numbers[:pool_size]
-        games = _build_rotating_core_games(top_pool)
+    for i, concurso in enumerate(test_df["concurso"].values):
+        top_pool = _build_ranked_pool_for_concurso(results, i, pool_size)
+        games = build_rotating_core_games(top_pool)
 
-        if len(games) < 5:
-            fallback = sorted(top_pool[:6])
-            while len(games) < 5:
-                if fallback not in games:
-                    games.append(fallback)
-                else:
-                    break
+        fallback = sorted(top_pool[:6])
+        while len(games) < 5:
+            if fallback not in games:
+                games.append(fallback)
+            else:
+                break
 
-        games_by_concurso[int(concurso)] = games[:5]
+        games_by_concurso[int(concurso)] = _dedupe_games(games)[:5]
 
     return _evaluate_games_for_concursos(
-        scored_test_df=scored_test_df,
+        df=df,
+        test_df=test_df,
         games_by_concurso=games_by_concurso,
         label="ROTATING CORE",
         pool_size=pool_size,
     )
 
 
-def predict_monte_carlo_games(scored_test_df: pd.DataFrame, pool_size: int = 10, mc_samples: int = 3000, mc_keep_games: int = 5, mc_mode: str = "core", seed: int = 42) -> dict:
-    rng = np.random.default_rng(seed)
+def predict_rotating_balance_games(
+    df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    results: dict,
+    pool_size: int = 10,
+) -> dict:
     games_by_concurso = {}
 
-    for concurso, concurso_df in scored_test_df.groupby("concurso"):
-        ranked_numbers = concurso_df.sort_values("score", ascending=False)["dezena"].astype(int).tolist()
-        top_pool = ranked_numbers[:pool_size]
-        weights = [float(pool_size - idx) for idx in range(pool_size)]
+    for i, concurso in enumerate(test_df["concurso"].values):
+        top_pool = _build_ranked_pool_for_concurso(results, i, pool_size)
+        games = build_rotating_balance_games(top_pool)
 
-        candidate_games = {}
-        for _ in range(mc_samples):
-            game = _weighted_sample_game(top_pool, weights, rng)
-            key = tuple(game)
-            score = _score_game_internal(game, top_pool, mode=mc_mode)
-            if key not in candidate_games or score > candidate_games[key]:
-                candidate_games[key] = score
+        fallback = sorted(top_pool[:6])
+        while len(games) < 5:
+            if fallback not in games:
+                games.append(fallback)
+            else:
+                break
 
-        selected_games = _select_diverse_games(candidate_games, keep_games=mc_keep_games, min_distance=6)
-        games_by_concurso[int(concurso)] = selected_games
+        games_by_concurso[int(concurso)] = _dedupe_games(games)[:5]
 
     return _evaluate_games_for_concursos(
-        scored_test_df=scored_test_df,
+        df=df,
+        test_df=test_df,
         games_by_concurso=games_by_concurso,
-        label=f"MONTE CARLO ({mc_mode.upper()})",
+        label="ROTATING BALANCE",
         pool_size=pool_size,
-        extra_info={"mc_samples": mc_samples, "mc_mode": mc_mode},
     )
 
 
-def predict_random_games(scored_test_df: pd.DataFrame, games_per_concurso: int = 5, seed: int = 42) -> dict:
+def predict_random_games(
+    df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    games_per_concurso: int = 5,
+    seed: int = 42,
+) -> dict:
     rng = np.random.default_rng(seed)
     games_by_concurso = {}
 
-    for concurso in scored_test_df["concurso"].unique().tolist():
+    for concurso in test_df["concurso"].values:
         games = []
         seen = set()
         while len(games) < games_per_concurso:
@@ -549,12 +694,91 @@ def predict_random_games(scored_test_df: pd.DataFrame, games_per_concurso: int =
         games_by_concurso[int(concurso)] = games
 
     return _evaluate_games_for_concursos(
-        scored_test_df=scored_test_df,
+        df=df,
+        test_df=test_df,
         games_by_concurso=games_by_concurso,
         label="ALEATÓRIO",
         pool_size=60,
         extra_info={"random_seed": seed},
     )
+
+
+def run_random_baseline_average(
+    df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    games_per_concurso: int = 5,
+    random_trials: int = 50,
+    seed_base: int = 1000,
+) -> dict:
+    summaries = []
+    for k in range(random_trials):
+        summaries.append(
+            predict_random_games(
+                df=df,
+                test_df=test_df,
+                games_per_concurso=games_per_concurso,
+                seed=seed_base + k,
+            )
+        )
+
+    keys_mean = [
+        "hit_rate_all_games",
+        "hit_rate_best_games",
+        "avg_hits_all_games",
+        "avg_hits_best_games",
+        "prize_score_total",
+        "best_prize_score_total",
+        "num_ternos_all",
+        "num_quadras_all",
+        "num_quinas_all",
+        "num_ternos_best",
+        "num_quadras_best",
+        "num_quinas_best",
+        "max_hits_all",
+        "max_hits_best",
+    ]
+
+    avg = {}
+    for key in keys_mean:
+        avg[key] = float(np.mean([s[key] for s in summaries]))
+
+    avg["label"] = f"ALEATÓRIO MÉDIO ({random_trials} trials)"
+    avg["total_concursos"] = summaries[0]["total_concursos"]
+    avg["games_per_concurso"] = summaries[0]["games_per_concurso"]
+    avg["total_games_generated"] = summaries[0]["total_games_generated"]
+    avg["pool_size"] = 60
+    avg["random_trials"] = random_trials
+    return avg
+
+
+# ======================================================================================
+# REPORTS
+# ======================================================================================
+
+def print_games_with_matches(summary: dict, top_n: int = 20) -> None:
+    matched_games = [g for g in summary["all_games"] if g["hits"] > 0]
+    matched_games = sorted(matched_games, key=lambda g: (g["hits"], g["prize_score"]), reverse=True)
+
+    print("\n" + "=" * 100)
+    print(f"JOGOS COM MATCH - {summary['label']}")
+    print("=" * 100)
+    print(f"Concursos no teste:         {summary['total_concursos']}")
+    print(f"Jogos por concurso:         {summary['games_per_concurso']}")
+    print(f"Total de jogos gerados:     {summary['total_games_generated']}")
+    print(f"Top report mostrado:        {min(top_n, len(matched_games))}")
+
+    if not matched_games:
+        print("Nenhum jogo com match foi encontrado.")
+        return
+
+    for g in matched_games[:top_n]:
+        extra_local = f" | Local {g['local']}" if g["hits"] >= 4 else ""
+        print(
+            f"Concurso {g['concurso']} | Data {g['data']}{extra_local} | "
+            f"Jogo #{g['game_id']} | "
+            f"Acertos {g['hits']}/6 | Prize {g['prize_score']} | "
+            f"Previsto {g['predicted']} | Real {g['actual']} | Match {g['matched']}"
+        )
 
 
 def print_summary_metrics(summary: dict) -> None:
@@ -565,10 +789,6 @@ def print_summary_metrics(summary: dict) -> None:
     print(f"Jogos por concurso:                   {summary['games_per_concurso']}")
     print(f"Total de jogos gerados:               {summary['total_games_generated']}")
     print(f"Pool de dezenas por concurso:         top-{summary['pool_size']}")
-    if "mc_samples" in summary:
-        print(f"Amostras Monte Carlo por concurso:    {summary['mc_samples']}")
-    if "mc_mode" in summary:
-        print(f"Modo Monte Carlo:                     {summary['mc_mode']}")
 
     print("\n--- Todos os jogos gerados ---")
     print(f"Hit rate geral:                       {summary['hit_rate_all_games']:.4f} ({summary['hit_rate_all_games'] * 100:.2f}%)")
@@ -593,160 +813,77 @@ def print_summary_metrics(summary: dict) -> None:
     print(f"Prize score total (melhor jogo):      {summary['best_prize_score_total']}")
 
 
-def print_vs_random(model_summary: dict, random_summary: dict) -> None:
+def print_vs_random(model_summary: dict, random_avg: dict) -> None:
     print("\n" + "=" * 100)
-    print("COMPARATIVO: MODELO VS ALEATÓRIO")
+    print("COMPARATIVO: MODELO VS ALEATÓRIO MÉDIO")
     print("=" * 100)
 
     def safe_div(a, b):
         return (a / b) if b not in (0, 0.0) else float("inf") if a > 0 else 0.0
 
-    print(f"Modelo:   {model_summary['label']}")
-    print(f"Aleatório:{random_summary['label']}")
+    print(f"Modelo:        {model_summary['label']}")
+    print(f"Aleatório avg: {random_avg['label']}")
 
     print("\n--- Todos os jogos ---")
     print(f"Hit rate modelo:                  {model_summary['hit_rate_all_games']:.4f}")
-    print(f"Hit rate aleatório:               {random_summary['hit_rate_all_games']:.4f}")
-    print(f"Lift hit rate vs acaso:           {safe_div(model_summary['hit_rate_all_games'], random_summary['hit_rate_all_games']):.4f}x")
-    print(f"Prize score modelo:               {model_summary['prize_score_total']}")
-    print(f"Prize score aleatório:            {random_summary['prize_score_total']}")
-    print(f"Lift prize score vs acaso:        {safe_div(model_summary['prize_score_total'], random_summary['prize_score_total']):.4f}x")
+    print(f"Hit rate aleatório médio:         {random_avg['hit_rate_all_games']:.4f}")
+    print(f"Lift hit rate vs acaso:           {safe_div(model_summary['hit_rate_all_games'], random_avg['hit_rate_all_games']):.4f}x")
+
+    print(f"Média acertos modelo:             {model_summary['avg_hits_all_games']:.4f}")
+    print(f"Média acertos aleatório:          {random_avg['avg_hits_all_games']:.4f}")
+    print(f"Lift média acertos:               {safe_div(model_summary['avg_hits_all_games'], random_avg['avg_hits_all_games']):.4f}x")
+
+    print(f"Prize score modelo:               {model_summary['prize_score_total']:.2f}")
+    print(f"Prize score aleatório médio:      {random_avg['prize_score_total']:.2f}")
+    print(f"Lift prize score vs acaso:        {safe_div(model_summary['prize_score_total'], random_avg['prize_score_total']):.4f}x")
+
+    print(f"Quadras modelo:                   {model_summary['num_quadras_all']}")
+    print(f"Quadras aleatório médio:          {random_avg['num_quadras_all']:.2f}")
+    print(f"Quinas modelo:                    {model_summary['num_quinas_all']}")
+    print(f"Quinas aleatório médio:           {random_avg['num_quinas_all']:.2f}")
 
     print("\n--- Melhor jogo por concurso ---")
     print(f"Hit rate best modelo:             {model_summary['hit_rate_best_games']:.4f}")
-    print(f"Hit rate best aleatório:          {random_summary['hit_rate_best_games']:.4f}")
-    print(f"Lift best vs acaso:               {safe_div(model_summary['hit_rate_best_games'], random_summary['hit_rate_best_games']):.4f}x")
-    print(f"Prize score best modelo:          {model_summary['best_prize_score_total']}")
-    print(f"Prize score best aleatório:       {random_summary['best_prize_score_total']}")
-    print(f"Lift best prize vs acaso:         {safe_div(model_summary['best_prize_score_total'], random_summary['best_prize_score_total']):.4f}x")
+    print(f"Hit rate best aleatório médio:    {random_avg['hit_rate_best_games']:.4f}")
+    print(f"Lift best vs acaso:               {safe_div(model_summary['hit_rate_best_games'], random_avg['hit_rate_best_games']):.4f}x")
+
+    print(f"Prize score best modelo:          {model_summary['best_prize_score_total']:.2f}")
+    print(f"Prize score best aleatório médio: {random_avg['best_prize_score_total']:.2f}")
+    print(f"Lift best prize vs acaso:         {safe_div(model_summary['best_prize_score_total'], random_avg['best_prize_score_total']):.4f}x")
+
     print(f"Max hits best modelo:             {model_summary['max_hits_best']}")
-    print(f"Max hits best aleatório:          {random_summary['max_hits_best']}")
+    print(f"Max hits best aleatório médio:    {random_avg['max_hits_best']:.2f}")
 
 
-def build_walk_forward_folds(concursos: list[int], train_concursos: int, test_concursos: int, step_concursos: int) -> list[tuple[list[int], list[int]]]:
-    folds = []
-    total = len(concursos)
-    start = train_concursos
-
-    while start + test_concursos <= total:
-        train_ids = concursos[:start]
-        test_ids = concursos[start:start + test_concursos]
-        folds.append((train_ids, test_ids))
-        start += step_concursos
-
-    return folds
-
-
-def run_walk_forward(long_df: pd.DataFrame, feature_cols: list[str], pool_size: int, mc_samples: int, mc_keep_games: int, mc_mode: str, random_trials: int, train_concursos: int, test_concursos: int, step_concursos: int) -> pd.DataFrame:
-    concursos = sorted(long_df["concurso"].unique().tolist())
-    folds = build_walk_forward_folds(concursos, train_concursos, test_concursos, step_concursos)
-
-    rows = []
-
-    for fold_idx, (train_ids, test_ids) in enumerate(folds, start=1):
-        train_df = long_df[long_df["concurso"].isin(train_ids)].copy()
-        test_df = long_df[long_df["concurso"].isin(test_ids)].copy()
-
-        model = fit_ranker(train_df, feature_cols)
-        scored_test = score_concursos(model, test_df, feature_cols)
-
-        rotating_core = predict_rotating_core_games(scored_test, pool_size=pool_size)
-        monte_carlo = predict_monte_carlo_games(
-            scored_test,
-            pool_size=pool_size,
-            mc_samples=mc_samples,
-            mc_keep_games=mc_keep_games,
-            mc_mode=mc_mode,
-            seed=42 + fold_idx,
-        )
-
-        random_summaries = []
-        for trial in range(random_trials):
-            random_summaries.append(
-                predict_random_games(scored_test, games_per_concurso=mc_keep_games, seed=1000 + fold_idx * 100 + trial)
-            )
-
-        def avg_metric(summaries, key):
-            vals = [s[key] for s in summaries]
-            return float(np.mean(vals))
-
-        random_avg = {
-            "hit_rate_all_games": avg_metric(random_summaries, "hit_rate_all_games"),
-            "hit_rate_best_games": avg_metric(random_summaries, "hit_rate_best_games"),
-            "prize_score_total": avg_metric(random_summaries, "prize_score_total"),
-            "best_prize_score_total": avg_metric(random_summaries, "best_prize_score_total"),
-            "max_hits_best": avg_metric(random_summaries, "max_hits_best"),
-            "num_quadras_best": avg_metric(random_summaries, "num_quadras_best"),
-            "num_quinas_best": avg_metric(random_summaries, "num_quinas_best"),
-        }
-
-        for label, summary in [("rotating_core", rotating_core), ("monte_carlo", monte_carlo)]:
-            rows.append({
-                "fold": fold_idx,
-                "mode": label,
-                "model_hit_rate": summary["hit_rate_all_games"],
-                "model_best_hit_rate": summary["hit_rate_best_games"],
-                "model_prize_score": summary["prize_score_total"],
-                "model_best_prize_score": summary["best_prize_score_total"],
-                "model_max_hits_best": summary["max_hits_best"],
-                "model_quadras_best": summary["num_quadras_best"],
-                "model_quinas_best": summary["num_quinas_best"],
-                "random_hit_rate": random_avg["hit_rate_all_games"],
-                "random_best_hit_rate": random_avg["hit_rate_best_games"],
-                "random_prize_score": random_avg["prize_score_total"],
-                "random_best_prize_score": random_avg["best_prize_score_total"],
-                "random_max_hits_best": random_avg["max_hits_best"],
-                "random_quadras_best": random_avg["num_quadras_best"],
-                "random_quinas_best": random_avg["num_quinas_best"],
-            })
-
-    return pd.DataFrame(rows)
+def composite_score(summary: dict) -> float:
+    """
+    Score composto da v8:
+    prioriza consistência, mas sem perder prêmio.
+    """
+    score = 0.0
+    score += summary["avg_hits_all_games"] * 20.0
+    score += summary["hit_rate_all_games"] * 100.0
+    score += summary["num_ternos_all"] * 1.5
+    score += summary["num_quadras_all"] * 8.0
+    score += summary["num_quinas_all"] * 30.0
+    score += summary["prize_score_total"] * 1.0
+    score += summary["max_hits_all"] * 2.0
+    return score
 
 
-def print_walk_forward_summary(wf_df: pd.DataFrame) -> None:
-    print("\n" + "=" * 100)
-    print("WALK-FORWARD SUMMARY")
-    print("=" * 100)
-
-    if wf_df.empty:
-        print("Nenhum fold gerado.")
-        return
-
-    grouped = wf_df.groupby("mode").mean(numeric_only=True)
-
-    for mode, row in grouped.iterrows():
-        print(f"\nModo: {mode}")
-        print(f"Hit rate modelo:              {row['model_hit_rate']:.4f}")
-        print(f"Hit rate aleatório:           {row['random_hit_rate']:.4f}")
-        print(f"Lift hit rate:                {(row['model_hit_rate'] / row['random_hit_rate']) if row['random_hit_rate'] > 0 else 0.0:.4f}x")
-        print(f"Best hit rate modelo:         {row['model_best_hit_rate']:.4f}")
-        print(f"Best hit rate aleatório:      {row['random_best_hit_rate']:.4f}")
-        print(f"Lift best hit rate:           {(row['model_best_hit_rate'] / row['random_best_hit_rate']) if row['random_best_hit_rate'] > 0 else 0.0:.4f}x")
-        print(f"Prize score modelo:           {row['model_prize_score']:.2f}")
-        print(f"Prize score aleatório:        {row['random_prize_score']:.2f}")
-        print(f"Best prize modelo:            {row['model_best_prize_score']:.2f}")
-        print(f"Best prize aleatório:         {row['random_best_prize_score']:.2f}")
-        print(f"Max hits best modelo:         {row['model_max_hits_best']:.2f}")
-        print(f"Max hits best aleatório:      {row['random_max_hits_best']:.2f}")
-        print(f"Quadras best modelo:          {row['model_quadras_best']:.2f}")
-        print(f"Quadras best aleatório:       {row['random_quadras_best']:.2f}")
-        print(f"Quinas best modelo:           {row['model_quinas_best']:.2f}")
-        print(f"Quinas best aleatório:        {row['random_quinas_best']:.2f}")
-
+# ======================================================================================
+# MAIN
+# ======================================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ML Mega Sena v7 - XGBRanker + walk-forward + random benchmark"
+        description="ML Mega Sena v8 - evolução conservadora da v6.5"
     )
-    parser.add_argument("--min-window", type=int, default=30)
+    parser.add_argument("--window", type=int, default=30)
     parser.add_argument("--pool-size", type=int, default=10)
-    parser.add_argument("--mc-mode", type=str, default="core", choices=["core", "spread"])
-    parser.add_argument("--mc-samples", type=int, default=3000)
-    parser.add_argument("--mc-keep-games", type=int, default=5)
-    parser.add_argument("--random-trials", type=int, default=100)
-    parser.add_argument("--train-concursos", type=int, default=2200)
-    parser.add_argument("--test-concursos", type=int, default=43)
-    parser.add_argument("--step-concursos", type=int, default=43)
+    parser.add_argument("--top-report", type=int, default=20)
+    parser.add_argument("--random-trials", type=int, default=50)
+    parser.add_argument("--random-seed", type=int, default=42)
 
     args = parser.parse_args()
 
@@ -757,87 +894,72 @@ def main():
     df = load_mega_sena(DATA_PATH)
 
     print("=" * 100)
-    print("MEGA SENA ML v7 - XGBRANKER + WALK-FORWARD + ACASO")
+    print("MEGA SENA ML v8 - BASE v6.5 + CONSISTÊNCIA + ACASO ROBUSTO")
     print("=" * 100)
     print(f"Concursos carregados: {len(df)}")
     print(f"Período: {df['data'].iloc[0]} até {df['data'].iloc[-1]}")
-    print(f"min_window:         {args.min_window}")
-    print(f"pool_size:          {args.pool_size}")
-    print(f"mc_mode:            {args.mc_mode}")
-    print(f"mc_samples:         {args.mc_samples}")
-    print(f"mc_keep_games:      {args.mc_keep_games}")
-    print(f"random_trials:      {args.random_trials}")
-    print(f"train_concursos:    {args.train_concursos}")
-    print(f"test_concursos:     {args.test_concursos}")
-    print(f"step_concursos:     {args.step_concursos}")
+    print(f"Window:              {args.window}")
+    print(f"Pool:                {args.pool_size}")
+    print(f"Random trials:       {args.random_trials}")
+    print(f"Random seed:         {args.random_seed}")
 
-    long_df = build_long_dataset(df, min_window=args.min_window)
-    feature_cols = get_feature_columns(long_df)
+    features_df = build_frequency_features(df, window=args.window)
+    features_df = build_target(df, features_df)
+    train_df, test_df = split_by_date(df, features_df)
 
-    print(f"Linhas do dataset longo: {len(long_df)}")
-    print(f"Concursos com features:  {long_df['concurso'].nunique()}")
-    print(f"Features usadas:         {len(feature_cols)}")
+    print(f"Treino: {len(train_df)} concursos")
+    print(f"Teste:  {len(test_df)} concursos")
 
-    # último bloco para inspeção direta
-    concursos = sorted(long_df["concurso"].unique().tolist())
-    train_ids = concursos[:-args.test_concursos]
-    test_ids = concursos[-args.test_concursos:]
+    results = train_and_evaluate(train_df=train_df, test_df=test_df)
 
-    train_df = long_df[long_df["concurso"].isin(train_ids)].copy()
-    test_df = long_df[long_df["concurso"].isin(test_ids)].copy()
-
-    print(f"Treino final: {len(train_ids)} concursos")
-    print(f"Teste final:  {len(test_ids)} concursos")
-
-    model = fit_ranker(train_df, feature_cols)
-    scored_test = score_concursos(model, test_df, feature_cols)
-
-    rotating_core = predict_rotating_core_games(scored_test, pool_size=args.pool_size)
-    monte_carlo = predict_monte_carlo_games(
-        scored_test,
+    rotating_core_summary = predict_rotating_core_games(
+        df=df,
+        test_df=test_df,
+        results=results,
         pool_size=args.pool_size,
-        mc_samples=args.mc_samples,
-        mc_keep_games=args.mc_keep_games,
-        mc_mode=args.mc_mode,
-        seed=42,
-    )
-    random_summary = predict_random_games(
-        scored_test,
-        games_per_concurso=args.mc_keep_games,
-        seed=42,
     )
 
-    candidates = [rotating_core, monte_carlo]
+    rotating_balance_summary = predict_rotating_balance_games(
+        df=df,
+        test_df=test_df,
+        results=results,
+        pool_size=args.pool_size,
+    )
+
+    random_avg = run_random_baseline_average(
+        df=df,
+        test_df=test_df,
+        games_per_concurso=5,
+        random_trials=args.random_trials,
+        seed_base=1000,
+    )
+
+    candidates = [rotating_core_summary, rotating_balance_summary]
     best_model_summary = sorted(
         candidates,
         key=lambda s: (
-            s["num_quinas_best"],
-            s["num_quadras_best"],
-            s["max_hits_best"],
-            s["best_prize_score_total"],
-            s["avg_hits_best_games"],
+            composite_score(s),
+            s["num_quinas_all"],
+            s["num_quadras_all"],
+            s["prize_score_total"],
+            s["avg_hits_all_games"],
         ),
         reverse=True
     )[0]
 
-    print_summary_metrics(rotating_core)
-    print_summary_metrics(monte_carlo)
-    print_summary_metrics(random_summary)
-    print_vs_random(best_model_summary, random_summary)
+    print_games_with_matches(best_model_summary, top_n=args.top_report)
 
-    wf_df = run_walk_forward(
-        long_df=long_df,
-        feature_cols=feature_cols,
-        pool_size=args.pool_size,
-        mc_samples=args.mc_samples,
-        mc_keep_games=args.mc_keep_games,
-        mc_mode=args.mc_mode,
-        random_trials=args.random_trials,
-        train_concursos=args.train_concursos,
-        test_concursos=args.test_concursos,
-        step_concursos=args.step_concursos,
-    )
-    print_walk_forward_summary(wf_df)
+    print_summary_metrics(rotating_core_summary)
+    print_summary_metrics(rotating_balance_summary)
+
+    print("\n" + "=" * 100)
+    print("COMPARATIVO INTERNO V8")
+    print("=" * 100)
+    print(f"Composite score - ROTATING CORE:     {composite_score(rotating_core_summary):.4f}")
+    print(f"Composite score - ROTATING BALANCE:  {composite_score(rotating_balance_summary):.4f}")
+    print(f"Melhor cenário v8:                   {best_model_summary['label']}")
+
+    print_vs_random(best_model_summary, random_avg)
 
 
 if __name__ == "__main__":
