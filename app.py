@@ -1,16 +1,18 @@
 """
-app.py - v8.4 SAFE
+app.py - v8.5 SAFE MIX
 
 Objetivo:
-- voltar a uma linha saudável
-- impedir inflação artificial de métricas
-- contar prêmios fortes por concurso único
-- penalizar redundância de jogos
-- comparar contra acaso usando a mesma régua
+- manter a linha saudável da v8.4 SAFE
+- adicionar mistura forte + média + rara (3,2,1)
+- reduzir vício de concentração
+- buscar quadras mais distribuídas
+- abrir caminho para quina
 
-Base:
-- herda a linha saudável da v8/v8.1
-- evita colapso de múltiplas quadras no mesmo concurso
+Modos comparados:
+- safe_balance_5
+- safe_hybrid_5
+- safe_321_mix_5
+- safe_321_pure_5
 """
 
 import argparse
@@ -354,36 +356,13 @@ def _dedupe_games(games: list[list[int]]) -> list[list[int]]:
     return out
 
 
+def _pairwise_redundancy_ok(candidate: list[int], selected: list[list[int]], max_overlap: int = 4) -> bool:
+    return all(_overlap_size(candidate, prev) <= max_overlap for prev in selected)
+
+
 # ======================================================================================
-# HEALTHY STRATEGIES
+# STRATEGIES
 # ======================================================================================
-
-def build_rotating_core_games(ranked_pool: list[int]) -> list[list[int]]:
-    rp = ranked_pool[:10]
-    if len(rp) < 8:
-        return [sorted(rp[:6])]
-
-    core = rp[:4]
-    tail = rp[4:]
-
-    pairs = [
-        (tail[0], tail[1]),
-        (tail[0], tail[2]) if len(tail) > 2 else None,
-        (tail[1], tail[2]) if len(tail) > 2 else None,
-        (tail[0], tail[3]) if len(tail) > 3 else None,
-        (tail[1], tail[3]) if len(tail) > 3 else None,
-    ]
-
-    games = []
-    for pair in pairs:
-        if pair is None:
-            continue
-        game = sorted(core + [pair[0], pair[1]])
-        if len(set(game)) == 6:
-            games.append(game)
-
-    return _dedupe_games(games)[:5]
-
 
 def build_rotating_balance_games(ranked_pool: list[int]) -> list[list[int]]:
     rp = ranked_pool[:10]
@@ -405,11 +384,8 @@ def build_rotating_balance_games(ranked_pool: list[int]) -> list[list[int]]:
 
     selected = []
     for g in _dedupe_games(candidates):
-        if not selected:
+        if not selected or _pairwise_redundancy_ok(g, selected, max_overlap=4):
             selected.append(g)
-        else:
-            if all(_game_distance(g, prev) >= 4 for prev in selected):
-                selected.append(g)
 
     if len(selected) < 5:
         for g in _dedupe_games(candidates):
@@ -422,35 +398,142 @@ def build_rotating_balance_games(ranked_pool: list[int]) -> list[list[int]]:
 
 
 def build_safe_hybrid_games(ranked_pool: list[int]) -> list[list[int]]:
-    """
-    3 jogos core + 2 jogos balance, com filtro anti-redundância.
-    """
-    core_games = build_rotating_core_games(ranked_pool)[:3]
-    balance_games = build_rotating_balance_games(ranked_pool)[:3]
+    balance_games = build_rotating_balance_games(ranked_pool)
+    rp = ranked_pool[:10]
+    if len(rp) < 8:
+        return balance_games[:5]
+
+    core = rp[:4]
+    tail = rp[4:]
+    extra = []
+    pairs = [
+        (tail[0], tail[1]),
+        (tail[0], tail[2]) if len(tail) > 2 else None,
+        (tail[1], tail[2]) if len(tail) > 2 else None,
+    ]
+    for pair in pairs:
+        if pair is None:
+            continue
+        extra.append(sorted(core + [pair[0], pair[1]]))
 
     selected = []
-    for g in core_games + balance_games:
-        if not selected:
+    for g in balance_games[:3] + extra[:3]:
+        if not selected or _pairwise_redundancy_ok(g, selected, max_overlap=4):
             selected.append(g)
-            continue
-
-        # evita jogos quase clones
-        if all(_overlap_size(g, prev) <= 4 for prev in selected):
-            selected.append(g)
-
         if len(selected) == 5:
             break
 
-    base = _dedupe_games(selected)
-
-    if len(base) < 5:
-        for g in _dedupe_games(core_games + balance_games):
-            if g not in base:
-                base.append(g)
-            if len(base) == 5:
+    if len(selected) < 5:
+        for g in _dedupe_games(balance_games + extra):
+            if g not in selected:
+                selected.append(g)
+            if len(selected) == 5:
                 break
 
-    return base[:5]
+    return selected[:5]
+
+
+def build_rare_candidates(ranked_full: list[int], features_row: pd.Series) -> list[int]:
+    """
+    Candidatos raros/frios controlados:
+    - usar ranks 16..30 do ranking
+    - priorizar maior atraso e menor frequência curta
+    """
+    rare_block = ranked_full[15:30]  # ranks 16..30
+    scored = []
+
+    for n in rare_block:
+        atraso = float(features_row.get(f"atraso_{n}", 0.0))
+        freq10 = float(features_row.get(f"freq_w10_{n}", 0.0))
+        freq30 = float(features_row.get(f"freq_w30_{n}", 0.0))
+        streak = float(features_row.get(f"streak_{n}", 0.0))
+
+        rare_score = (
+            atraso * 1.5
+            - freq10 * 20.0
+            - freq30 * 10.0
+            - streak * 0.5
+        )
+        scored.append((n, rare_score))
+
+    scored = sorted(scored, key=lambda x: x[1], reverse=True)
+    return [n for n, _ in scored]
+
+
+def build_321_mix_games(ranked_full: list[int], ranked_pool: list[int], features_row: pd.Series) -> list[list[int]]:
+    """
+    Carteira mista:
+    jogo 1 -> baseline balance
+    jogo 2 -> 3,2,1 conservador
+    jogo 3 -> 3,2,1 padrão
+    jogo 4 -> 3,1,2 exploratório
+    jogo 5 -> 2,3,1 balanceado aberto
+    """
+    strong = ranked_full[:6]
+    medium = ranked_full[6:15]
+    rare = build_rare_candidates(ranked_full, features_row)
+
+    baseline = build_rotating_balance_games(ranked_pool)
+    games = []
+
+    if baseline:
+        games.append(baseline[0])
+
+    candidates = [
+        sorted(strong[:3] + medium[:2] + rare[:1]),          # 3,2,1 conservador
+        sorted([strong[0], strong[1], strong[3], medium[2], medium[4], rare[1]]),   # 3,2,1 padrão
+        sorted([strong[0], strong[2], strong[4], medium[1], rare[0], rare[2]]),      # 3,1,2
+        sorted([strong[1], strong[3], medium[0], medium[3], medium[5], rare[3]]),    # 2,3,1
+        sorted([strong[0], strong[5], medium[1], medium[6], medium[7], rare[4]]),    # alternativo
+    ]
+
+    for g in candidates:
+        if len(set(g)) == 6:
+            if not games or _pairwise_redundancy_ok(g, games, max_overlap=4):
+                games.append(g)
+        if len(games) == 5:
+            break
+
+    if len(games) < 5:
+        for g in _dedupe_games(candidates + baseline):
+            if g not in games:
+                games.append(g)
+            if len(games) == 5:
+                break
+
+    return _dedupe_games(games)[:5]
+
+
+def build_321_pure_games(ranked_full: list[int], features_row: pd.Series) -> list[list[int]]:
+    """
+    100% baseado em 3,2,1 e variações próximas.
+    """
+    strong = ranked_full[:6]
+    medium = ranked_full[6:15]
+    rare = build_rare_candidates(ranked_full, features_row)
+
+    candidates = [
+        sorted(strong[:3] + medium[:2] + rare[:1]),                                    # 3,2,1
+        sorted([strong[0], strong[1], strong[4], medium[0], medium[3], rare[1]]),     # 3,2,1
+        sorted([strong[1], strong[2], strong[5], medium[1], medium[4], rare[2]]),     # 3,2,1
+        sorted([strong[0], strong[2], strong[4], medium[2], rare[0], rare[3]]),       # 3,1,2
+        sorted([strong[3], strong[5], medium[0], medium[5], medium[6], rare[4]]),     # 2,3,1
+    ]
+
+    selected = []
+    for g in candidates:
+        if len(set(g)) == 6:
+            if not selected or _pairwise_redundancy_ok(g, selected, max_overlap=4):
+                selected.append(g)
+
+    if len(selected) < 5:
+        for g in _dedupe_games(candidates):
+            if g not in selected:
+                selected.append(g)
+            if len(selected) == 5:
+                break
+
+    return selected[:5]
 
 
 # ======================================================================================
@@ -472,8 +555,6 @@ def compute_redundancy_metrics(games: list[list[int]]) -> dict:
 
     avg_overlap = float(np.mean(overlaps)) if overlaps else 0.0
     max_overlap = float(np.max(overlaps)) if overlaps else 0.0
-
-    # penalidade cresce acima de 3 dezenas compartilhadas em média
     redundancy_penalty = max(0.0, avg_overlap - 3.0) + max(0.0, max_overlap - 4.0) * 0.5
 
     return {
@@ -508,7 +589,6 @@ def summarize_generated_games(
     hit_rate_best = (total_best_hits / total_best_numbers) if total_best_numbers > 0 else 0.0
     best_prize_score_total = sum(g["prize_score"] for g in best_games)
 
-    # SAFE: conta no máximo um prêmio forte por concurso
     unique_quadra_concursos = sum(1 for c in concursos_data if c["best_game"] and c["best_game"]["hits"] == 4)
     unique_quina_concursos = sum(1 for c in concursos_data if c["best_game"] and c["best_game"]["hits"] == 5)
     unique_sena_concursos = sum(1 for c in concursos_data if c["best_game"] and c["best_game"]["hits"] == 6)
@@ -636,25 +716,32 @@ def _evaluate_games_for_concursos(
 
 
 # ======================================================================================
-# SAFE MODES
+# MODES
 # ======================================================================================
 
-def predict_mode(df: pd.DataFrame, test_df: pd.DataFrame, results: dict, pool_size: int, mode_name: str) -> dict:
+def predict_mode(df: pd.DataFrame, features_df: pd.DataFrame, test_df: pd.DataFrame, results: dict, pool_size: int, mode_name: str) -> dict:
     games_by_concurso = {}
 
-    for i, concurso in enumerate(test_df["concurso"].values):
-        top_pool = _build_ranked_pool_for_concurso(results, i, pool_size)
+    # map concurso -> feature row
+    feat_map = features_df.set_index("concurso")
 
-        if mode_name == "safe_core_5":
-            games = build_rotating_core_games(top_pool)
-        elif mode_name == "safe_balance_5":
-            games = build_rotating_balance_games(top_pool)
+    for i, concurso in enumerate(test_df["concurso"].values):
+        ranked_full = _build_ranked_pool_for_concurso(results, i, 30)
+        ranked_pool = ranked_full[:pool_size]
+        feat_row = feat_map.loc[int(concurso)]
+
+        if mode_name == "safe_balance_5":
+            games = build_rotating_balance_games(ranked_pool)
         elif mode_name == "safe_hybrid_5":
-            games = build_safe_hybrid_games(top_pool)
+            games = build_safe_hybrid_games(ranked_pool)
+        elif mode_name == "safe_321_mix_5":
+            games = build_321_mix_games(ranked_full, ranked_pool, feat_row)
+        elif mode_name == "safe_321_pure_5":
+            games = build_321_pure_games(ranked_full, feat_row)
         else:
             raise ValueError(f"Modo inválido: {mode_name}")
 
-        fallback = sorted(top_pool[:6])
+        fallback = sorted(ranked_pool[:6])
         while len(games) < 5:
             if fallback not in games:
                 games.append(fallback)
@@ -838,21 +925,18 @@ def print_summary_metrics(summary: dict) -> None:
     print(f"Ternos totais:                        {summary['num_ternos_all']}")
     print(f"Quadras totais:                       {summary['num_quadras_all']}")
     print(f"Quinas totais:                        {summary['num_quinas_all']}")
-    print(f"Senas totais:                         {summary['num_senas_all']}")
     print(f"Prize score total:                    {summary['prize_score_total']}")
 
     print("\n--- SAFE: prêmio único por concurso ---")
     print(f"Ternos únicos:                        {summary['num_ternos_unique']}")
     print(f"Quadras únicas:                       {summary['num_quadras_unique']}")
     print(f"Quinas únicas:                        {summary['num_quinas_unique']}")
-    print(f"Senas únicas:                         {summary['num_senas_unique']}")
     print(f"Prize score único total:              {summary['prize_score_unique_total']}")
 
     print("\n--- Melhor jogo de cada concurso ---")
     print(f"Hit rate melhor jogo:                 {summary['hit_rate_best_games']:.4f} ({summary['hit_rate_best_games'] * 100:.2f}%)")
     print(f"Média de acertos do melhor jogo:      {summary['avg_hits_best_games']:.4f}")
     print(f"Maior acerto (melhor jogo):           {summary['max_hits_best']}")
-    print(f"Menor acerto (melhor jogo):           {summary['min_hits_best']}")
     print(f"Prize score total (melhor jogo):      {summary['best_prize_score_total']}")
 
     print("\n--- Redundância ---")
@@ -930,7 +1014,7 @@ def print_vs_random_safe(model_summary: dict, random_avg: dict, random_trials: l
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ML Mega Sena v8.4 SAFE - benchmark anti-vício"
+        description="ML Mega Sena v8.5 SAFE MIX - fortes + médias + raras"
     )
     parser.add_argument("--window", type=int, default=30)
     parser.add_argument("--pool-size", type=int, default=10)
@@ -947,7 +1031,7 @@ def main():
     df = load_mega_sena(DATA_PATH)
 
     print("=" * 100)
-    print("MEGA SENA ML v8.4 SAFE - ANTI-VÍCIO")
+    print("MEGA SENA ML v8.5 SAFE MIX - 3,2,1")
     print("=" * 100)
     print(f"Concursos carregados: {len(df)}")
     print(f"Período: {df['data'].iloc[0]} até {df['data'].iloc[-1]}")
@@ -966,9 +1050,10 @@ def main():
     results = train_and_evaluate(train_df=train_df, test_df=test_df)
 
     mode_names = [
-        "safe_core_5",
         "safe_balance_5",
         "safe_hybrid_5",
+        "safe_321_mix_5",
+        "safe_321_pure_5",
     ]
 
     summaries = []
@@ -976,6 +1061,7 @@ def main():
         summaries.append(
             predict_mode(
                 df=df,
+                features_df=features_df,
                 test_df=test_df,
                 results=results,
                 pool_size=args.pool_size,
@@ -1005,10 +1091,10 @@ def main():
     )
     random_summary = summarize_random_trials(random_trials)
 
-    print_games_with_matches(best_safe, top_n=args.top-report if False else args.top_report)
+    print_games_with_matches(best_safe, top_n=args.top_report)
 
     print("\n" + "=" * 100)
-    print("COMPARATIVO INTERNO v8.4 SAFE")
+    print("COMPARATIVO INTERNO v8.5")
     print("=" * 100)
     for s in summaries:
         print(
@@ -1024,7 +1110,7 @@ def main():
             f"safe_score={safe_score(s):.4f}"
         )
 
-    print(f"\nMelhor cenário SAFE: {best_safe['label']}")
+    print(f"\nMelhor cenário SAFE MIX: {best_safe['label']}")
 
     for s in summaries:
         print_summary_metrics(s)
