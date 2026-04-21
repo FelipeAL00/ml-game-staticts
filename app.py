@@ -195,7 +195,11 @@ def split_by_date(df_original: pd.DataFrame, features_df: pd.DataFrame):
         df_original[["concurso", "data_parsed"]],
         on="concurso",
         how="left",
+        suffixes=("", "_orig"),
     )
+    if "data_parsed_orig" in features_df.columns:
+        features_df = features_df.drop(columns=["data_parsed_orig"])
+
     train = features_df[features_df["data_parsed"] < CUTOFF_DATE].copy()
     test = features_df[features_df["data_parsed"] >= CUTOFF_DATE].copy()
     return train, test
@@ -259,8 +263,8 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
 
     for n in range(1, TOTAL_NUMBERS + 1):
         target_col = f"target_{n}"
-        y_train = train_df[target_col].values
-        y_test = test_df[target_col].values
+        y_train_full = train_df[target_col].values.astype(int)
+        y_test = test_df[target_col].values.astype(int)
 
         model = build_xgboost_model()
         model.fit(X_train, y_train)
